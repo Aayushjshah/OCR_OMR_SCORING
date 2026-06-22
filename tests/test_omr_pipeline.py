@@ -2,12 +2,23 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from PIL import Image
+
+from app import (
+    MAX_FOLDER_UPLOAD_BYTES,
+    MAX_FOLDER_UPLOAD_FILES,
+    estimated_combined_pdf_seconds,
+    format_duration,
+    validate_combined_pdf,
+    validate_folder_upload_limits,
+)
 from omr_pipeline import (
     answer_key_from_csv,
     evaluate_answers,
     normalize_weight_map,
     parse_omr_text,
     parse_submission_text,
+    preprocess_image_for_ocr,
     save_answer_key_json,
     score_submission,
 )
@@ -221,6 +232,46 @@ Email ID: *candidate 57@example.com*
             with self.subTest(text=text):
                 parsed = parse_submission_text(text)
                 self.assertEqual(parsed["candidate"]["exam_set"], expected)
+
+    def test_preprocess_darkens_blue_ink(self):
+        with TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "blue.png"
+            output = Path(temp_dir) / "processed.png"
+            image = Image.new("RGB", (40, 40), "white")
+            for x in range(12, 28):
+                for y in range(12, 28):
+                    image.putpixel((x, y), (35, 45, 140))
+            image.save(source)
+
+            preprocess_image_for_ocr(source, output)
+            processed = Image.open(output).convert("RGB")
+
+            self.assertLess(sum(processed.getpixel((20, 20))), 30)
+
+    def test_validate_combined_pdf_counts_pages(self):
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "combined.pdf"
+            pages = [
+                Image.new("RGB", (80, 80), "white"),
+                Image.new("RGB", (80, 80), "white"),
+            ]
+            pages[0].save(path, save_all=True, append_images=pages[1:])
+
+            self.assertEqual(validate_combined_pdf(path), 2)
+
+    def test_combined_pdf_estimated_time(self):
+        self.assertEqual(estimated_combined_pdf_seconds(4), 60)
+        self.assertEqual(format_duration(45), "45 sec")
+        self.assertEqual(format_duration(75), "1 min 15 sec")
+
+    def test_folder_upload_limits(self):
+        validate_folder_upload_limits(MAX_FOLDER_UPLOAD_FILES, MAX_FOLDER_UPLOAD_BYTES)
+
+        with self.assertRaises(ValueError):
+            validate_folder_upload_limits(MAX_FOLDER_UPLOAD_FILES + 1, 1)
+
+        with self.assertRaises(ValueError):
+            validate_folder_upload_limits(1, MAX_FOLDER_UPLOAD_BYTES + 1)
 
     def test_save_answer_key_json(self):
         with TemporaryDirectory() as temp_dir:

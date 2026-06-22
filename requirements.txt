@@ -1,3 +1,7 @@
 fastapi
+numpy
+opencv-python-headless
+pillow
+pypdf
 uvicorn
 python-multipart

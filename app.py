@@ -9,19 +9,23 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from pypdf import PdfReader
 
 from omr_pipeline import (
     SUPPORTED_DOCUMENT_SUFFIXES,
+    call_lighton_chat_ocr_image,
     call_lighton_chat_ocr_file,
     candidate_set_name,
     load_answer_key_for_set,
     parse_submission_text,
+    render_pdf_pages,
     save_answer_key_json,
     score_submission,
 )
@@ -37,6 +41,11 @@ OCR_MODEL = os.environ.get("LIGHTON_OCR_MODEL", "lightonai/LightOnOCR-2-1B")
 OCR_API_KEY = os.environ.get("LIGHTON_OCR_API_KEY")
 OCR_TIMEOUT = int(os.environ.get("OMR_OCR_TIMEOUT", "120"))
 PDF_DPI = int(os.environ.get("OMR_PDF_DPI", "300"))
+MAX_COMBINED_PDF_BYTES = int(os.environ.get("OMR_MAX_COMBINED_PDF_MB", "40")) * 1024 * 1024
+MAX_COMBINED_PDF_PAGES = int(os.environ.get("OMR_MAX_COMBINED_PDF_PAGES", "250"))
+MAX_FOLDER_UPLOAD_BYTES = int(os.environ.get("OMR_MAX_FOLDER_UPLOAD_MB", "40")) * 1024 * 1024
+MAX_FOLDER_UPLOAD_FILES = int(os.environ.get("OMR_MAX_FOLDER_UPLOAD_FILES", "250"))
+ESTIMATED_SECONDS_PER_PAGE = int(os.environ.get("OMR_ESTIMATED_SECONDS_PER_PAGE", "15"))
 
 app = FastAPI(title="OMR Evaluation Service")
 
@@ -77,6 +86,71 @@ async def save_upload(upload: UploadFile, subdir: str) -> Path:
     return target
 
 
+def pdf_page_count(path: Path) -> int:
+    reader = PdfReader(str(path))
+    return len(reader.pages)
+
+
+def format_duration(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds} sec"
+    minutes, remainder = divmod(seconds, 60)
+    if remainder == 0:
+        return f"{minutes} min"
+    return f"{minutes} min {remainder} sec"
+
+
+def estimated_combined_pdf_seconds(page_count: int) -> int:
+    return page_count * ESTIMATED_SECONDS_PER_PAGE
+
+
+def validate_folder_upload_limits(file_count: int, total_bytes: int) -> None:
+    if file_count > MAX_FOLDER_UPLOAD_FILES:
+        raise ValueError(f"Folder upload has {file_count} files; maximum allowed is {MAX_FOLDER_UPLOAD_FILES}")
+    if total_bytes > MAX_FOLDER_UPLOAD_BYTES:
+        limit_mb = MAX_FOLDER_UPLOAD_BYTES // (1024 * 1024)
+        raise ValueError(f"Folder upload exceeds {limit_mb} MB limit")
+
+
+def upload_file_size(upload: UploadFile) -> int:
+    size = getattr(upload, "size", None)
+    if isinstance(size, int):
+        return size
+
+    current = upload.file.tell()
+    upload.file.seek(0, 2)
+    total = upload.file.tell()
+    upload.file.seek(current)
+    return total
+
+
+def validate_upload_batch(files: list[UploadFile]) -> int:
+    total_bytes = sum(upload_file_size(upload) for upload in files)
+    validate_folder_upload_limits(len(files), total_bytes)
+    return total_bytes
+
+
+def validate_combined_pdf(path: Path) -> int:
+    if path.suffix.lower() != ".pdf":
+        raise ValueError("Combined upload must be a PDF")
+    if path.stat().st_size > MAX_COMBINED_PDF_BYTES:
+        limit_mb = MAX_COMBINED_PDF_BYTES // (1024 * 1024)
+        raise ValueError(f"Combined PDF exceeds {limit_mb} MB limit")
+    pages = pdf_page_count(path)
+    if pages > MAX_COMBINED_PDF_PAGES:
+        raise ValueError(f"Combined PDF has {pages} pages; maximum allowed is {MAX_COMBINED_PDF_PAGES}")
+    return pages
+
+
+def score_ocr_text(ocr_text: str) -> dict[str, Any]:
+    parsed = parse_submission_text(ocr_text)
+    set_name = candidate_set_name(parsed)
+    if not set_name:
+        raise ValueError("Set is missing from OCR output")
+    answer_key = load_answer_key_for_set(set_name, KEY_DIR)
+    return score_submission(parsed, answer_key)
+
+
 def score_path(path: Path) -> dict[str, Any]:
     if path.suffix.lower() not in SUPPORTED_DOCUMENT_SUFFIXES:
         raise ValueError(f"Unsupported file type: {path.suffix}")
@@ -89,12 +163,7 @@ def score_path(path: Path) -> dict[str, Any]:
         timeout_seconds=OCR_TIMEOUT,
         pdf_dpi=PDF_DPI,
     )
-    parsed = parse_submission_text(ocr_text)
-    set_name = candidate_set_name(parsed)
-    if not set_name:
-        raise ValueError("Set is missing from OCR output")
-    answer_key = load_answer_key_for_set(set_name, KEY_DIR)
-    result = score_submission(parsed, answer_key)
+    result = score_ocr_text(ocr_text)
 
     stamp = int(time.time() * 1000)
     base = safe_filename(path.stem)
@@ -277,11 +346,21 @@ def index() -> str:
           </form>
         </section>
         <section>
+          <h2>Combined PDF</h2>
+          <form id="combined-pdf-form">
+            <label for="combined-pdf-file">One PDF, one OMR sheet per page</label>
+            <input id="combined-pdf-file" name="file" type="file" accept=".pdf,application/pdf" required>
+            <p class="hint">Maximum {MAX_COMBINED_PDF_PAGES} pages and {MAX_COMBINED_PDF_BYTES // (1024 * 1024)} MB. Approx {ESTIMATED_SECONDS_PER_PAGE} seconds per page.</p>
+            <button type="submit">Process Combined PDF</button>
+          </form>
+        </section>
+        <section>
           <h2>Score Folder</h2>
-          <form action="/api/score-upload-batch" method="post" enctype="multipart/form-data">
+          <form id="folder-form">
             <label for="folder-files">Browser folder upload</label>
             <input id="folder-files" name="files" type="file" webkitdirectory directory multiple required>
-            <button type="submit">Download CSV</button>
+            <p class="hint">Maximum {MAX_FOLDER_UPLOAD_FILES} files and {MAX_FOLDER_UPLOAD_BYTES // (1024 * 1024)} MB total.</p>
+            <button type="submit">Process Folder</button>
           </form>
           <form action="/api/score-folder-path" method="post">
             <label for="folder-path">Server folder path</label>
@@ -303,6 +382,9 @@ def index() -> str:
   <script>
     const result = document.getElementById('result');
     const copyResult = document.getElementById('copy-result');
+    const maxCombinedPdfBytes = {MAX_COMBINED_PDF_BYTES};
+    const maxFolderUploadBytes = {MAX_FOLDER_UPLOAD_BYTES};
+    const maxFolderUploadFiles = {MAX_FOLDER_UPLOAD_FILES};
     async function copyText(text) {{
       if (navigator.clipboard && window.isSecureContext) {{
         await navigator.clipboard.writeText(text);
@@ -338,6 +420,123 @@ def index() -> str:
       result.classList.remove('error');
       result.textContent = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
     }}
+    async function postFolderForm(form) {{
+      const data = new FormData(form);
+      const files = data.getAll('files');
+      const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
+      result.classList.remove('error');
+      if (files.length > maxFolderUploadFiles) {{
+        result.classList.add('error');
+        result.textContent = `Folder upload has ${{files.length}} files; maximum allowed is ${{maxFolderUploadFiles}}.`;
+        return;
+      }}
+      if (totalBytes > maxFolderUploadBytes) {{
+        result.classList.add('error');
+        result.textContent = `Folder upload exceeds ${{Math.round(maxFolderUploadBytes / 1024 / 1024)}} MB limit.`;
+        return;
+      }}
+      result.textContent = `Preparing upload for ${{files.length}} file(s)...`;
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/api/score-upload-batch-json');
+      xhr.upload.addEventListener('progress', event => {{
+        if (event.lengthComputable) {{
+          const percent = Math.round((event.loaded / event.total) * 100);
+          result.textContent = `Uploading folder... ${{percent}}%\\n${{files.length}} file(s) queued for scoring.`;
+        }} else {{
+          result.textContent = `Uploading folder...\\n${{files.length}} file(s) queued for scoring.`;
+        }}
+      }});
+      xhr.upload.addEventListener('load', () => {{
+        result.textContent = `Upload complete. Processing ${{files.length}} file(s) on server...`;
+      }});
+      xhr.onload = () => {{
+        let payload;
+        try {{ payload = JSON.parse(xhr.responseText); }} catch {{ payload = xhr.responseText; }}
+        if (xhr.status < 200 || xhr.status >= 300) {{
+          result.classList.add('error');
+          result.textContent = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
+          return;
+        }}
+        result.classList.remove('error');
+        const summary = [
+          `Done. Processed ${{payload.processed_files}} / ${{payload.total_files}} file(s).`,
+          `Successful: ${{payload.successful_files}}`,
+          `Failed: ${{payload.failed_files}}`,
+          '',
+          `CSV: ${{window.location.origin + payload.download_url}}`,
+          '',
+          JSON.stringify(payload.rows, null, 2)
+        ].join('\\n');
+        result.textContent = summary;
+      }};
+      xhr.onerror = () => {{
+        result.classList.add('error');
+        result.textContent = 'Upload failed before the server could process the folder.';
+      }};
+      result.textContent = `Uploading folder...\\n${{files.length}} file(s) queued for scoring.`;
+      xhr.send(data);
+    }}
+    async function postCombinedPdfForm(form) {{
+      const file = form.querySelector('input[type="file"]').files[0];
+      if (!file) {{
+        result.classList.add('error');
+        result.textContent = 'Select a combined PDF first.';
+        return;
+      }}
+      if (!file.name.toLowerCase().endsWith('.pdf')) {{
+        result.classList.add('error');
+        result.textContent = 'Combined upload must be a PDF.';
+        return;
+      }}
+      if (file.size > maxCombinedPdfBytes) {{
+        result.classList.add('error');
+        result.textContent = `Combined PDF exceeds ${{Math.round(maxCombinedPdfBytes / 1024 / 1024)}} MB limit.`;
+        return;
+      }}
+
+      const data = new FormData(form);
+      result.classList.remove('error');
+      result.textContent = `Preparing upload for ${{file.name}}...`;
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/api/score-combined-pdf');
+      xhr.upload.addEventListener('progress', event => {{
+        if (event.lengthComputable) {{
+          const percent = Math.round((event.loaded / event.total) * 100);
+          result.textContent = `Uploading combined PDF... ${{percent}}%`;
+        }} else {{
+          result.textContent = 'Uploading combined PDF...';
+        }}
+      }});
+      xhr.upload.addEventListener('load', () => {{
+        result.textContent = 'Upload complete. Rendering pages and processing OMR sheets...';
+      }});
+      xhr.onload = () => {{
+        let payload;
+        try {{ payload = JSON.parse(xhr.responseText); }} catch {{ payload = xhr.responseText; }}
+        if (xhr.status < 200 || xhr.status >= 300) {{
+          result.classList.add('error');
+          result.textContent = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
+          return;
+        }}
+        result.classList.remove('error');
+        const summary = [
+          `Done. Processed ${{payload.processed_pages}} / ${{payload.total_pages}} page(s).`,
+          `Approx time: ${{payload.estimated_processing_time}} (${{payload.estimated_processing_seconds}} sec)`,
+          `Successful: ${{payload.successful_pages}}`,
+          `Failed: ${{payload.failed_pages}}`,
+          '',
+          `CSV: ${{window.location.origin + payload.download_url}}`,
+          '',
+          JSON.stringify(payload.rows, null, 2)
+        ].join('\\n');
+        result.textContent = summary;
+      }};
+      xhr.onerror = () => {{
+        result.classList.add('error');
+        result.textContent = 'Upload failed before the server could process the combined PDF.';
+      }};
+      xhr.send(data);
+    }}
     document.getElementById('key-form').addEventListener('submit', event => {{
       event.preventDefault();
       postForm(event.currentTarget, '/api/answer-keys');
@@ -345,6 +544,14 @@ def index() -> str:
     document.getElementById('file-form').addEventListener('submit', event => {{
       event.preventDefault();
       postForm(event.currentTarget, '/api/score-file');
+    }});
+    document.getElementById('folder-form').addEventListener('submit', event => {{
+      event.preventDefault();
+      postFolderForm(event.currentTarget);
+    }});
+    document.getElementById('combined-pdf-form').addEventListener('submit', event => {{
+      event.preventDefault();
+      postCombinedPdfForm(event.currentTarget);
     }});
   </script>
 </body>
@@ -381,6 +588,15 @@ async def score_file(file: UploadFile = File(...)) -> JSONResponse:
 
 @app.post("/api/score-upload-batch")
 async def score_upload_batch(files: list[UploadFile] = File(...)) -> FileResponse:
+    try:
+        output_path, _ = await process_upload_batch(files)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return FileResponse(output_path, media_type="text/csv", filename=output_path.name)
+
+
+async def process_upload_batch(files: list[UploadFile]) -> tuple[Path, list[dict[str, Any]]]:
+    validate_upload_batch(files)
     rows: list[dict[str, Any]] = []
     batch = f"batch_{int(time.time())}"
     for upload in files:
@@ -391,7 +607,89 @@ async def score_upload_batch(files: list[UploadFile] = File(...)) -> FileRespons
         except Exception as error:
             rows.append(row_from_result(upload.filename or saved.name, {}, str(error)))
     output_path = write_score_csv(rows, prefix="upload_scores")
-    return FileResponse(output_path, media_type="text/csv", filename=output_path.name)
+    return output_path, rows
+
+
+def process_combined_pdf(path: Path, original_name: str) -> tuple[Path, list[dict[str, Any]], int]:
+    page_count = validate_combined_pdf(path)
+    rows: list[dict[str, Any]] = []
+
+    with tempfile.TemporaryDirectory(prefix="omr_combined_pdf_") as temp_dir:
+        pages = render_pdf_pages(path, temp_dir, dpi=PDF_DPI)
+        if len(pages) != page_count:
+            page_count = len(pages)
+        for index, page in enumerate(pages, start=1):
+            source = f"{original_name} page {index}"
+            try:
+                ocr_text = call_lighton_chat_ocr_image(
+                    page,
+                    OCR_BASE_URL,
+                    OCR_MODEL,
+                    api_key=OCR_API_KEY,
+                    timeout_seconds=OCR_TIMEOUT,
+                )
+                result = score_ocr_text(ocr_text)
+                rows.append(row_from_result(source, result))
+            except Exception as error:
+                rows.append(row_from_result(source, {}, str(error)))
+
+    output_path = write_score_csv(rows, prefix="combined_pdf_scores")
+    return output_path, rows, page_count
+
+
+@app.post("/api/score-upload-batch-json")
+async def score_upload_batch_json(files: list[UploadFile] = File(...)) -> JSONResponse:
+    try:
+        output_path, rows = await process_upload_batch(files)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    failed_files = sum(1 for row in rows if row.get("error"))
+    return JSONResponse(
+        {
+            "total_files": len(files),
+            "processed_files": len(rows),
+            "successful_files": len(rows) - failed_files,
+            "failed_files": failed_files,
+            "csv_path": str(output_path),
+            "download_url": f"/api/download/{output_path.name}",
+            "rows": rows,
+        }
+    )
+
+
+@app.post("/api/score-combined-pdf")
+async def score_combined_pdf(file: UploadFile = File(...)) -> JSONResponse:
+    saved = await save_upload(file, "combined_pdfs")
+    try:
+        output_path, rows, page_count = process_combined_pdf(saved, file.filename or saved.name)
+    except Exception as error:
+        saved.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+    failed_pages = sum(1 for row in rows if row.get("error"))
+    estimated_seconds = estimated_combined_pdf_seconds(page_count)
+    return JSONResponse(
+        {
+            "total_pages": page_count,
+            "processed_pages": len(rows),
+            "estimated_processing_seconds": estimated_seconds,
+            "estimated_processing_time": format_duration(estimated_seconds),
+            "successful_pages": len(rows) - failed_pages,
+            "failed_pages": failed_pages,
+            "csv_path": str(output_path),
+            "download_url": f"/api/download/{output_path.name}",
+            "rows": rows,
+        }
+    )
+
+
+@app.get("/api/download/{filename}")
+def download_output(filename: str) -> FileResponse:
+    safe_name = safe_filename(filename)
+    path = OUTPUT_DIR / safe_name
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Output file not found")
+    return FileResponse(path, media_type="text/csv", filename=path.name)
 
 
 @app.post("/api/score-folder-path")

@@ -56,6 +56,23 @@ Set: set1
 
 The OCR call itself is wired through the LightOn chat-completions endpoint.
 
+Images and rendered PDF pages are preprocessed before OCR: EXIF orientation is normalized, blue/purple ink is darkened to black, and contrast/sharpness are increased. This improves detection of OMR bubbles filled with blue pen.
+
+## Combined PDF
+
+Use the Combined PDF upload when one PDF contains many student OMR sheets, one sheet per page. The service renders each page, scores it as one student, and returns a CSV.
+
+Limits:
+
+- Maximum combined PDF size: `40 MB`
+- Maximum combined PDF pages: `250`
+- Estimated processing time: `15 seconds/page`
+
+Browser folder upload limits:
+
+- Maximum files: `250`
+- Maximum total upload size: `40 MB`
+
 ## Outputs
 
 - Imported answer-key JSON files are stored in `answer_keys/`.

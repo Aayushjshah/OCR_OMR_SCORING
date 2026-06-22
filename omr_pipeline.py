@@ -37,6 +37,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from PIL import Image, ImageEnhance, ImageOps
+
 
 FILLED_MARK_CHARS = {"●", "⬤", "◉", "⦿", "■", "◆", "•"}
 EMPTY_MARK_CHARS = {"○", "◯", "◌", "◇", "□"}
@@ -810,6 +812,40 @@ def find_chat_message_content(payload: Any) -> str | None:
     return find_text_value(payload)
 
 
+def preprocess_image_for_ocr(image_path: str | Path, output_path: str | Path) -> Path:
+    image = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
+
+    try:
+        import cv2
+        import numpy as np
+
+        rgb = np.array(ImageEnhance.Color(image).enhance(1.45))
+        red = rgb[:, :, 0].astype(np.int16)
+        green = rgb[:, :, 1].astype(np.int16)
+        blue = rgb[:, :, 2].astype(np.int16)
+        blue_ink = (
+            (blue > 55)
+            & (blue > red + 18)
+            & (blue > green + 8)
+            & (red < 170)
+            & (green < 185)
+        )
+        mask = (blue_ink.astype(np.uint8) * 255)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), dtype=np.uint8))
+        rgb[mask > 0] = (0, 0, 0)
+        image = Image.fromarray(rgb)
+    except ImportError:
+        image = ImageEnhance.Color(image).enhance(1.45)
+
+    image = ImageEnhance.Contrast(image).enhance(1.35)
+    image = ImageEnhance.Sharpness(image).enhance(1.15)
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output, format="PNG")
+    return output
+
+
 def call_lighton_chat_ocr_image(
     image_path: str | Path,
     base_url: str,
@@ -819,8 +855,10 @@ def call_lighton_chat_ocr_image(
     max_tokens: int = 4096,
 ) -> str:
     path = Path(image_path)
-    mime_type = mimetypes.guess_type(path.name)[0] or "image/png"
-    image_data = base64.b64encode(path.read_bytes()).decode("ascii")
+    with tempfile.TemporaryDirectory(prefix="omr_preprocess_") as temp_dir:
+        ocr_image_path = preprocess_image_for_ocr(path, Path(temp_dir) / "ocr-input.png")
+        mime_type = mimetypes.guess_type(ocr_image_path.name)[0] or "image/png"
+        image_data = base64.b64encode(ocr_image_path.read_bytes()).decode("ascii")
     payload = {
         "model": model,
         "temperature": 0,
