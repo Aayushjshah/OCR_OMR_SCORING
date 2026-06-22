@@ -123,6 +123,15 @@ def normalize_ocr_set_name(value: str) -> str | None:
     return f"set{compact}".lower()
 
 
+def normalize_set_search_line(line: str) -> str:
+    normalized = html_lib.unescape(line)
+    normalized = re.sub(r"\\text\s*\{\s*([^{}]+?)\s*\}", r"\1", normalized)
+    normalized = re.sub(r"\\(?:long)?(?:right)?arrow|\\to", " -> ", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"[$*_`{}]+", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()
+
+
 def extract_name(text: str) -> str | None:
     for line in text.splitlines():
         match = re.search(
@@ -136,12 +145,25 @@ def extract_name(text: str) -> str | None:
 
 
 def extract_email(text: str) -> str | None:
+    label_pattern = re.compile(
+        r"\b(?:e[-\s]*)?mail(?:\s*(?:id|address))?\b\s*[:\-–—]\s*(.+)$",
+        flags=re.IGNORECASE,
+    )
     labeled_pattern = re.compile(
         r"\b(?:e[-\s]*)?mail(?:\s*(?:id|address))?\b\s*[:\-–—]\s*"
         r"([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})",
         flags=re.IGNORECASE,
     )
     for line in text.splitlines():
+        label_match = label_pattern.search(line)
+        if label_match:
+            cleaned = clean_ocr_value(label_match.group(1))
+            if cleaned:
+                compact = re.sub(r"\s+", "", cleaned)
+                email_match = re.search(r"\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b", compact, flags=re.IGNORECASE)
+                if email_match:
+                    return email_match.group(0).strip()
+
         match = labeled_pattern.search(line)
         if match:
             return match.group(1).strip()
@@ -153,12 +175,13 @@ def extract_email(text: str) -> str | None:
 def extract_set_name(text: str) -> str | None:
     set_pattern = re.compile(
         r"\b(?:exam|paper|question\s*paper)?\s*set\s*"
-        r"(?:no\.?|number|name)?\s*(?:[:#\-–—]|\s)\s*"
+        r"(?:no\.?|number|name)?\s*(?:[:#=\-–—>→⇒➜➔↦]+\s*|\s+)"
         r"((?:set\s*[-_:]?\s*)?[A-Z0-9]+)\b",
         flags=re.IGNORECASE,
     )
     for line in text.splitlines():
-        match = set_pattern.search(line)
+        normalized = normalize_set_search_line(line)
+        match = set_pattern.search(normalized)
         if match:
             return normalize_ocr_set_name(match.group(1))
     return None
@@ -354,6 +377,18 @@ def parse_option_cell(cell: str) -> tuple[str, bool] | None:
     return option, bool(marker)
 
 
+def parse_table_option_cell(cell: str, option_index: int) -> tuple[str, bool] | None:
+    explicit = parse_option_cell(cell)
+    if explicit is not None:
+        return explicit
+
+    marker = marker_value(cell)
+    if marker is None:
+        return None
+    options = generated_options(option_index + 1)
+    return options[option_index], bool(marker)
+
+
 def selection_from_option_marks(option_marks: list[tuple[str, bool]]) -> Selection:
     if not option_marks:
         return Selection(selected=None, status="missing")
@@ -395,7 +430,7 @@ def extract_html_table_answers(text: str) -> dict[str, dict[str, Any]]:
 
     for cell in cells:
         question_match = re.fullmatch(r"(?:q(?:uestion)?\s*)?(\d{1,3})", cell, flags=re.IGNORECASE)
-        option_mark = parse_option_cell(cell)
+        option_mark = parse_table_option_cell(cell, len(option_marks)) if current_question else None
         if question_match:
             append_marked_answer(answers_by_id, current_question, option_marks)
             current_question = question_match.group(1)

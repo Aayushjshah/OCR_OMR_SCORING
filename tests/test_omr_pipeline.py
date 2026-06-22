@@ -184,11 +184,36 @@ Set: set1
         self.assertEqual(answers["10"]["status"], "unmarked")
         self.assertEqual(answers["16"]["selected"], None)
 
+    def test_parse_marker_only_pdf_table_output(self):
+        sample = """SET-1
+
+Name: *Test Candidate*
+Email ID: *candidate 57@example.com*
+
+<table>
+  <tr><td>1</td><td>●</td><td>B</td><td>C</td><td>D</td><td>9</td><td>A</td><td>B</td><td>C</td><td>●</td></tr>
+  <tr><td>2</td><td>A</td><td>●</td><td>C</td><td>D</td><td>10</td><td>A</td><td>B</td><td>C</td><td>D</td></tr>
+</table>
+"""
+
+        parsed = parse_submission_text(sample)
+        answers = {answer["question_id"]: answer for answer in parsed["answers"]}
+
+        self.assertEqual(parsed["candidate"]["email"], "candidate57@example.com")
+        self.assertEqual(parsed["candidate"]["exam_set"], "set1")
+        self.assertEqual(answers["1"]["selected"], "A")
+        self.assertEqual(answers["2"]["selected"], "B")
+        self.assertEqual(answers["9"]["selected"], "D")
+        self.assertEqual(answers["10"]["selected"], None)
+        self.assertEqual(answers["10"]["status"], "unmarked")
+
     def test_set_regex_variants(self):
         cases = {
             "SET-1\nName: A": "set1",
             "Exam Set: set2\nName: A": "set2",
             "paper set - A\nName: A": "seta",
+            "$\\text{SET} \\rightarrow 3$\nName: A": "set3",
+            "SET -> 4\nName: A": "set4",
             "Name: A\nEmail: a@example.com": None,
         }
 
