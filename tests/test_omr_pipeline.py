@@ -247,6 +247,7 @@ Email ID: *candidate 57@example.com*
             processed = Image.open(output).convert("RGB")
 
             self.assertLess(sum(processed.getpixel((20, 20))), 30)
+            self.assertTrue(all(channel == 255 or channel % 8 == 0 for channel in processed.getpixel((5, 5))))
 
     def test_validate_combined_pdf_counts_pages(self):
         with TemporaryDirectory() as temp_dir:

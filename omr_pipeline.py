@@ -839,6 +839,14 @@ def preprocess_image_for_ocr(image_path: str | Path, output_path: str | Path) ->
 
     image = ImageEnhance.Contrast(image).enhance(1.35)
     image = ImageEnhance.Sharpness(image).enhance(1.15)
+    try:
+        import numpy as np
+
+        rgb = np.array(image, dtype=np.uint16)
+        rgb = ((rgb + 4) // 8) * 8
+        image = Image.fromarray(np.clip(rgb, 0, 255).astype(np.uint8))
+    except ImportError:
+        pass
 
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
