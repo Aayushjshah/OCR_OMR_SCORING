@@ -20,9 +20,13 @@ from pypdf import PdfReader
 
 from omr_pipeline import (
     SUPPORTED_DOCUMENT_SUFFIXES,
+    SUPPORTED_IMAGE_SUFFIXES,
     call_lighton_chat_ocr_image,
     call_lighton_chat_ocr_file,
+    call_lighton_identity_ocr_image,
     candidate_set_name,
+    detect_answers_from_image,
+    detect_marked_set_from_image,
     load_answer_key_for_set,
     parse_submission_text,
     render_pdf_pages,
@@ -66,12 +70,14 @@ def row_from_result(source: str, result: dict[str, Any], error: str | None = Non
         "source": source,
         "name": result.get("name") if result else "",
         "email": result.get("email") if result else "",
+        "roll_no": result.get("roll_no") if result else "",
         "set": result.get("set") if result else "",
         "answered_questions": result.get("answered_questions") if result else "",
         "total_questions": result.get("total_questions") if result else "",
         "unanswered_questions": result.get("unanswered_questions") if result else "",
         "score": result.get("score") if result else "",
         "max_score": result.get("max_score") if result else "",
+        "warnings": "; ".join(result.get("identity_warnings", [])) if result else "",
         "error": error or "",
     }
 
@@ -142,8 +148,32 @@ def validate_combined_pdf(path: Path) -> int:
     return pages
 
 
-def score_ocr_text(ocr_text: str) -> dict[str, Any]:
+def merge_identity_candidate(parsed: dict[str, Any], identity_ocr_text: str | None = None, image_path: Path | None = None) -> None:
+    candidate = parsed.setdefault("candidate", {})
+    if identity_ocr_text:
+        identity = parse_submission_text(identity_ocr_text)
+        identity_candidate = identity.get("candidate", {})
+        for field in ("name", "email", "roll_no"):
+            value = identity_candidate.get(field)
+            if value not in (None, ""):
+                candidate[field] = value
+
+    if image_path is not None and image_path.suffix.lower() in SUPPORTED_IMAGE_SUFFIXES:
+        detected_set = detect_marked_set_from_image(image_path)
+        if detected_set:
+            candidate["exam_set"] = detected_set
+        detected_answers = detect_answers_from_image(image_path)
+        if len(detected_answers) >= 12:
+            parsed["answers"] = detected_answers
+
+
+def score_ocr_text(
+    ocr_text: str,
+    identity_ocr_text: str | None = None,
+    image_path: Path | None = None,
+) -> dict[str, Any]:
     parsed = parse_submission_text(ocr_text)
+    merge_identity_candidate(parsed, identity_ocr_text=identity_ocr_text, image_path=image_path)
     set_name = candidate_set_name(parsed)
     if not set_name:
         raise ValueError("Set is missing from OCR output")
@@ -155,19 +185,61 @@ def score_path(path: Path) -> dict[str, Any]:
     if path.suffix.lower() not in SUPPORTED_DOCUMENT_SUFFIXES:
         raise ValueError(f"Unsupported file type: {path.suffix}")
 
-    ocr_text = call_lighton_chat_ocr_file(
-        path,
-        OCR_BASE_URL,
-        OCR_MODEL,
-        api_key=OCR_API_KEY,
-        timeout_seconds=OCR_TIMEOUT,
-        pdf_dpi=PDF_DPI,
-    )
-    result = score_ocr_text(ocr_text)
+    identity_ocr_text = None
+    identity_image_path: Path | None = path if path.suffix.lower() in SUPPORTED_IMAGE_SUFFIXES else None
+
+    if path.suffix.lower() == ".pdf":
+        with tempfile.TemporaryDirectory(prefix="omr_pdf_score_") as temp_dir:
+            pages = render_pdf_pages(path, temp_dir, dpi=PDF_DPI)
+            if not pages:
+                raise RuntimeError(f"No pages rendered from {path}")
+            identity_image_path = pages[0]
+            page_text = [
+                f"<!-- ===== {page.name} ===== -->\n"
+                + call_lighton_chat_ocr_image(
+                    page,
+                    OCR_BASE_URL,
+                    OCR_MODEL,
+                    api_key=OCR_API_KEY,
+                    timeout_seconds=OCR_TIMEOUT,
+                )
+                for page in pages
+            ]
+            ocr_text = "\n\n".join(page_text)
+            identity_ocr_text = call_lighton_identity_ocr_image(
+                identity_image_path,
+                OCR_BASE_URL,
+                OCR_MODEL,
+                api_key=OCR_API_KEY,
+                timeout_seconds=OCR_TIMEOUT,
+            )
+            result = score_ocr_text(ocr_text, identity_ocr_text=identity_ocr_text, image_path=identity_image_path)
+    else:
+        ocr_text = call_lighton_chat_ocr_file(
+            path,
+            OCR_BASE_URL,
+            OCR_MODEL,
+            api_key=OCR_API_KEY,
+            timeout_seconds=OCR_TIMEOUT,
+            pdf_dpi=PDF_DPI,
+        )
+
+        if identity_image_path is not None:
+            identity_ocr_text = call_lighton_identity_ocr_image(
+                identity_image_path,
+                OCR_BASE_URL,
+                OCR_MODEL,
+                api_key=OCR_API_KEY,
+                timeout_seconds=OCR_TIMEOUT,
+            )
+        result = score_ocr_text(ocr_text, identity_ocr_text=identity_ocr_text, image_path=identity_image_path)
 
     stamp = int(time.time() * 1000)
     base = safe_filename(path.stem)
-    (OUTPUT_DIR / f"{base}_{stamp}.ocr.txt").write_text(ocr_text + "\n", encoding="utf-8")
+    saved_ocr_text = ocr_text
+    if identity_ocr_text:
+        saved_ocr_text = f"<!-- ===== identity-header ===== -->\n{identity_ocr_text}\n\n<!-- ===== full-page ===== -->\n{ocr_text}"
+    (OUTPUT_DIR / f"{base}_{stamp}.ocr.txt").write_text(saved_ocr_text + "\n", encoding="utf-8")
     (OUTPUT_DIR / f"{base}_{stamp}.result.json").write_text(
         json.dumps({"source": str(path), **result}, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
@@ -185,12 +257,14 @@ def write_score_csv(rows: list[dict[str, Any]], prefix: str = "scores") -> Path:
                 "source",
                 "name",
                 "email",
+                "roll_no",
                 "set",
                 "answered_questions",
                 "total_questions",
                 "unanswered_questions",
                 "score",
                 "max_score",
+                "warnings",
                 "error",
             ],
         )
@@ -628,7 +702,14 @@ def process_combined_pdf(path: Path, original_name: str) -> tuple[Path, list[dic
                     api_key=OCR_API_KEY,
                     timeout_seconds=OCR_TIMEOUT,
                 )
-                result = score_ocr_text(ocr_text)
+                identity_ocr_text = call_lighton_identity_ocr_image(
+                    page,
+                    OCR_BASE_URL,
+                    OCR_MODEL,
+                    api_key=OCR_API_KEY,
+                    timeout_seconds=OCR_TIMEOUT,
+                )
+                result = score_ocr_text(ocr_text, identity_ocr_text=identity_ocr_text, image_path=page)
                 rows.append(row_from_result(source, result))
             except Exception as error:
                 rows.append(row_from_result(source, {}, str(error)))

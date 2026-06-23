@@ -9,11 +9,15 @@ from app import (
     MAX_FOLDER_UPLOAD_FILES,
     estimated_combined_pdf_seconds,
     format_duration,
+    row_from_result,
     validate_combined_pdf,
     validate_folder_upload_limits,
 )
 from omr_pipeline import (
+    OPTION_LETTERS,
     answer_key_from_csv,
+    detect_answers_from_image,
+    detect_marked_set_from_image,
     evaluate_answers,
     normalize_weight_map,
     parse_omr_text,
@@ -108,7 +112,7 @@ class OmrPipelineTest(unittest.TestCase):
 
         self.assertEqual(parsed["candidate"]["name"], "Lalitha")
         self.assertEqual(parsed["candidate"]["date"], "18/06/25")
-        self.assertEqual(parsed["candidate"]["exam_set"]["selected"], "B")
+        self.assertEqual(parsed["candidate"]["exam_set"]["selected"], "set2")
         self.assertEqual(parsed["candidate"]["roll_no"]["raw"], "3 P G 0 3 T T 0 0 9")
 
         answers = {answer["question_id"]: answer for answer in parsed["answers"]}
@@ -148,6 +152,7 @@ class OmrPipelineTest(unittest.TestCase):
         parsed = parse_submission_text(
             """Name: Ada Lovelace
 Email: ada@example.com
+Roll No.: 23EE0446
 Set: set1
 1: D
 2: B
@@ -163,12 +168,121 @@ Set: set1
 
         self.assertEqual(result["name"], "Ada Lovelace")
         self.assertEqual(result["email"], "ada@example.com")
+        self.assertEqual(result["roll_no"], "23EE0446")
         self.assertEqual(result["set"], "set1")
         self.assertEqual(result["answered_questions"], 3)
         self.assertEqual(result["total_questions"], 3)
         self.assertEqual(result["unanswered_questions"], 0)
         self.assertEqual(result["score"], 5.0)
         self.assertEqual(result["max_score"], 8.0)
+
+    def test_parse_final_layout_marked_set_and_roll_no(self):
+        parsed = parse_submission_text(
+            """OMR ANSWER SHEET
+Name: Saravana Prabhu T
+Email ID: saravanaprabhu.t.eee2023@citchennai.net
+Set No.: 1 ○ 2 ● 3 ○ 4 ○
+Roll No.: 23EE0446
+
+1 A ○ B ○ C ● D ○
+2 A ○ B ● C ○ D ○
+"""
+        )
+        key = {
+            "answers": {"1": "C", "2": "A"},
+            "weights": {"1": 1, "2": 1},
+        }
+
+        result = score_submission(parsed, key)
+        row = row_from_result("filled.jpg", result)
+
+        self.assertEqual(parsed["candidate"]["exam_set"], "set2")
+        self.assertEqual(parsed["candidate"]["roll_no"], "23EE0446")
+        self.assertEqual(result["set"], "set2")
+        self.assertEqual(result["roll_no"], "23EE0446")
+        self.assertEqual(row["roll_no"], "23EE0446")
+        self.assertEqual(result["score"], 1.0)
+
+    def test_parse_identity_from_cropped_ocr_table(self):
+        parsed = parse_submission_text(
+            """<table>
+  <tr><td>Name:</td><td>SARAVANA PRABHU . I</td><td>Set No.:</td><td>○ 1 ● ○ 2 ○ 4</td></tr>
+  <tr><td>Email ID:</td><td>SARAVANAPRABHU I. EEE 2023@CITCHENNAI.NET</td><td>Roll No.:</td><td>23E5046</td></tr>
+</table>"""
+        )
+
+        self.assertEqual(parsed["candidate"]["name"], "SARAVANA PRABHU . I")
+        self.assertEqual(parsed["candidate"]["email"], "SARAVANAPRABHUI.EEE2023@CITCHENNAI.NET")
+        self.assertEqual(parsed["candidate"]["roll_no"], "23E5046")
+
+    def test_detect_marked_set_from_image(self):
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "set.png"
+            image = Image.new("RGB", (1200, 1600), "white")
+            centers = [(835, 277), (871, 278), (914, 279), (952, 282)]
+            for index, (x, y) in enumerate(centers):
+                for dx in range(-13, 14):
+                    for dy in range(-13, 14):
+                        distance = (dx * dx + dy * dy) ** 0.5
+                        if 11 <= distance <= 13:
+                            image.putpixel((x + dx, y + dy), (0, 0, 0))
+                        elif index == 1 and distance <= 9:
+                            image.putpixel((x + dx, y + dy), (30, 35, 120))
+            image.save(path)
+
+            self.assertEqual(detect_marked_set_from_image(path), "set2")
+
+    def test_detect_answers_from_image(self):
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "answers.png"
+            image = Image.new("RGB", (1200, 1600), "white")
+            left_xs = [260, 320, 380, 440]
+            right_xs = [700, 760, 820, 880]
+            row_ys = [515, 628, 745, 865, 990, 1121, 1257, 1396]
+            selections = {
+                "1": "C",
+                "2": "B",
+                "3": "A",
+                "4": "B",
+                "5": "C",
+                "6": "B",
+                "7": "C",
+                "8": "B",
+                "9": "B",
+                "10": "B",
+                "11": "B",
+                "12": "C",
+                "13": "A",
+                "14": "C",
+                "15": "B",
+                "16": "C",
+            }
+            for row_index, y in enumerate(row_ys):
+                for question_id, xs in ((str(row_index + 1), left_xs), (str(row_index + 9), right_xs)):
+                    selected = selections[question_id]
+                    for option_index, x in enumerate(xs):
+                        for dx in range(-18, 19):
+                            for dy in range(-18, 19):
+                                distance = (dx * dx + dy * dy) ** 0.5
+                                if 16 <= distance <= 18:
+                                    image.putpixel((x + dx, y + dy), (0, 0, 0))
+                                elif OPTION_LETTERS[option_index] == selected and distance <= 13:
+                                    image.putpixel((x + dx, y + dy), (30, 35, 120))
+            image.save(path)
+
+            answers = {answer["question_id"]: answer["selected"] for answer in detect_answers_from_image(path)}
+
+            self.assertEqual(answers, selections)
+
+    def test_set_marker_row_defaults_to_numbered_sets(self):
+        parsed = parse_omr_text(
+            """Set No.
+○ ● ○ ○
+Roll No.: 23EE0446
+"""
+        )
+
+        self.assertEqual(parsed["candidate"]["exam_set"]["selected"], "set2")
 
     def test_parse_lighton_json_table_output(self):
         sample = """{

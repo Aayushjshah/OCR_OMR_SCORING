@@ -38,7 +38,8 @@ The parser extracts:
 
 - `Name:` / `Candidate Name:` / `Full Name:`
 - `Email:` / `Email ID:` / `Email Address:`
-- set labels such as `SET-1`, `Set: set1`, `Exam Set: set2`
+- `Roll No.:`
+- set labels such as `SET-1`, `Set: set1`, `Exam Set: set2`, plus marked `Set No.` bubbles `1` through `4`
 - answers marked with filled OCR bubbles such as `A ●`, including HTML table cells from LightOn output
 
 Unmarked answers are returned with `selected: null` and `status: "unmarked"`.
@@ -48,6 +49,7 @@ The plain text format below is also supported:
 ```text
 Name: Candidate Name
 Email: candidate@example.com
+Roll No.: 23EE0446
 Set: set1
 1: A
 2: C
@@ -77,4 +79,4 @@ Browser folder upload limits:
 
 - Imported answer-key JSON files are stored in `answer_keys/`.
 - OCR text and per-file scoring JSON are stored in `outputs/`.
-- Batch scoring returns a CSV with `source,name,email,set,score,max_score,error`.
+- Batch scoring returns a CSV with `source,name,email,roll_no,set,score,max_score,error`.

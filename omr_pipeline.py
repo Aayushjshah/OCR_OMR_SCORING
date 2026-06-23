@@ -23,6 +23,7 @@ import argparse
 import base64
 import csv
 import html as html_lib
+import itertools
 import json
 import mimetypes
 import os
@@ -43,6 +44,7 @@ from PIL import Image, ImageEnhance, ImageOps
 FILLED_MARK_CHARS = {"●", "⬤", "◉", "⦿", "■", "◆", "•"}
 EMPTY_MARK_CHARS = {"○", "◯", "◌", "◇", "□"}
 OPTION_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+DEFAULT_SET_OPTIONS = ["1", "2", "3", "4"]
 SUPPORTED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 SUPPORTED_DOCUMENT_SUFFIXES = SUPPORTED_IMAGE_SUFFIXES | {".pdf", ".txt", ".json"}
 
@@ -114,6 +116,60 @@ def clean_ocr_value(value: str) -> str | None:
     return cleaned or None
 
 
+def html_table_cells(text: str) -> list[str]:
+    cells = re.findall(r"<(?:td|th)\b[^>]*>(.*?)</(?:td|th)>", text, flags=re.IGNORECASE | re.DOTALL)
+    return [clean_ocr_value(cell) or "" for cell in cells]
+
+
+def normalized_label(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def is_identity_label(value: str) -> bool:
+    label = normalized_label(value)
+    return label in {
+        "name",
+        "email",
+        "email id",
+        "email address",
+        "roll no",
+        "roll number",
+        "set no",
+        "set number",
+    }
+
+
+def extract_labeled_html_value(text: str, labels: set[str]) -> str | None:
+    cells = html_table_cells(text)
+    wanted = {normalized_label(label) for label in labels}
+    for index, cell in enumerate(cells[:-1]):
+        if normalized_label(cell) not in wanted:
+            continue
+        for value in cells[index + 1 :]:
+            if value and not is_identity_label(value):
+                return value
+    return None
+
+
+def normalize_roll_no(value: Any) -> str | None:
+    if isinstance(value, dict):
+        raw = clean_ocr_value(str(value.get("raw") or ""))
+        if raw:
+            return re.sub(r"\s+", "", raw).upper()
+
+        selected = value.get("selected_by_column") or []
+        if isinstance(selected, list):
+            parts: list[str] = []
+            for item in selected:
+                if item in (None, "") or isinstance(item, list):
+                    return None
+                parts.append(str(item))
+            return "".join(parts) or None
+
+    cleaned = clean_ocr_value(str(value)) if value not in (None, "") else None
+    return re.sub(r"\s+", "", cleaned).upper() if cleaned else None
+
+
 def normalize_ocr_set_name(value: str) -> str | None:
     cleaned = clean_ocr_value(value)
     if not cleaned:
@@ -123,6 +179,20 @@ def normalize_ocr_set_name(value: str) -> str | None:
     if not compact:
         return None
     return f"set{compact}".lower()
+
+
+def normalize_marked_set_selection(value: str | list[str] | None) -> str | list[str] | None:
+    if isinstance(value, list):
+        normalized = [normalize_marked_set_selection(item) for item in value]
+        return [item for item in normalized if isinstance(item, str)] or None
+    if value in (None, ""):
+        return None
+    if re.fullmatch(r"[A-Z]", str(value).strip(), flags=re.IGNORECASE):
+        index = OPTION_LETTERS.index(str(value).strip().upper())
+        if index < len(DEFAULT_SET_OPTIONS):
+            return normalize_ocr_set_name(DEFAULT_SET_OPTIONS[index])
+        return None
+    return normalize_ocr_set_name(str(value))
 
 
 def normalize_set_search_line(line: str) -> str:
@@ -135,6 +205,10 @@ def normalize_set_search_line(line: str) -> str:
 
 
 def extract_name(text: str) -> str | None:
+    html_value = extract_labeled_html_value(text, {"name"})
+    if html_value:
+        return clean_ocr_value(html_value)
+
     for line in text.splitlines():
         match = re.search(
             r"\b(?:candidate\s*)?(?:full\s*)?name\b\s*(?:id)?\s*[:\-–—]\s*(.+)$",
@@ -147,6 +221,13 @@ def extract_name(text: str) -> str | None:
 
 
 def extract_email(text: str) -> str | None:
+    html_value = extract_labeled_html_value(text, {"email", "email id", "email address"})
+    if html_value:
+        compact = re.sub(r"\s+", "", html_value)
+        email_match = re.search(r"\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b", compact, flags=re.IGNORECASE)
+        if email_match:
+            return email_match.group(0).strip()
+
     label_pattern = re.compile(
         r"\b(?:e[-\s]*)?mail(?:\s*(?:id|address))?\b\s*[:\-–—]\s*(.+)$",
         flags=re.IGNORECASE,
@@ -174,6 +255,28 @@ def extract_email(text: str) -> str | None:
     return match.group(0).strip() if match else None
 
 
+def extract_roll_no(text: str) -> str | None:
+    html_value = extract_labeled_html_value(text, {"roll no", "roll number"})
+    if html_value:
+        return normalize_roll_no(html_value)
+
+    for line in text.splitlines():
+        match = re.search(r"\broll\s*(?:no|number)\.?\s*[:#=\-–—]?\s*(.+)$", line, flags=re.IGNORECASE)
+        if not match:
+            continue
+        value = clean_ocr_value(match.group(1))
+        if not value:
+            continue
+        value = re.split(
+            r"\b(?:instructions|candidate\s+signature|for\s+office\s+use)\b",
+            value,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+        return normalize_roll_no(value)
+    return None
+
+
 def extract_set_name(text: str) -> str | None:
     set_pattern = re.compile(
         r"\b(?:exam|paper|question\s*paper)?\s*set\s*"
@@ -185,7 +288,63 @@ def extract_set_name(text: str) -> str | None:
         normalized = normalize_set_search_line(line)
         match = set_pattern.search(normalized)
         if match:
-            return normalize_ocr_set_name(match.group(1))
+            candidate = match.group(1)
+            if candidate.lower() in {"no", "number", "name"}:
+                continue
+            return normalize_ocr_set_name(candidate)
+    return None
+
+
+def parse_set_option_header(line: str) -> list[str] | None:
+    tokens = line.split()
+    if 2 <= len(tokens) <= 10 and all(re.fullmatch(r"[A-Z0-9]+", token, flags=re.IGNORECASE) for token in tokens):
+        return [token.upper() for token in tokens]
+    return None
+
+
+def marked_options_from_text(text: str, default_options: list[str] | None = None) -> list[tuple[str, bool]]:
+    marker_chars = "".join(re.escape(char) for char in FILLED_MARK_CHARS | EMPTY_MARK_CHARS)
+    option_marks: list[tuple[str, bool]] = []
+
+    for match in re.finditer(rf"\b([A-Z0-9]+)\b\s*([{marker_chars}])", text, flags=re.IGNORECASE):
+        option_marks.append((match.group(1).upper(), bool(marker_value(match.group(2)))))
+
+    if option_marks:
+        return option_marks
+
+    markers = re.findall(rf"[{marker_chars}]", text)
+    if not markers:
+        return []
+
+    options = default_options or generated_options(len(markers))
+    if len(options) != len(markers):
+        options = generated_options(len(markers))
+    return [(options[index], bool(marker_value(marker))) for index, marker in enumerate(markers)]
+
+
+def extract_marked_set_name(text: str) -> str | None:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    label_pattern = re.compile(r"\b(?:exam\s*)?set(?:\s*(?:no\.?|number|name))?\b", flags=re.IGNORECASE)
+
+    for index, line in enumerate(lines):
+        label = label_pattern.search(normalize_set_search_line(line))
+        if not label:
+            continue
+
+        candidates = [line[label.end() :]]
+        if index + 1 < len(lines):
+            candidates.append(lines[index + 1])
+        if index + 2 < len(lines):
+            candidates.append(f"{lines[index + 1]} {lines[index + 2]}")
+
+        for candidate in candidates:
+            option_marks = marked_options_from_text(candidate, DEFAULT_SET_OPTIONS)
+            if not option_marks:
+                continue
+            selection = selection_from_option_marks(option_marks)
+            normalized = normalize_marked_set_selection(selection.selected)
+            return normalized if isinstance(normalized, str) else None
+
     return None
 
 
@@ -292,16 +451,29 @@ def parse_omr_text(ocr_text: str) -> dict[str, Any]:
             index += 1
             continue
 
-        if line.lower() == "exam set":
+        if re.fullmatch(r"(?:exam\s*)?set(?:\s*(?:no\.?|number|name))?", line, flags=re.IGNORECASE):
             pending_exam_set = True
             current_subject = None
             current_section = None
             index += 1
             continue
 
-        if line.lower() == "roll no":
+        roll_value = parse_key_value(line, "Roll No.") or parse_key_value(line, "Roll No") or parse_key_value(line, "Roll Number")
+        if roll_value is not None:
+            candidate["roll_no"] = normalize_roll_no(roll_value)
+            index += 1
+            continue
+
+        if re.fullmatch(r"roll\s*(?:no|number)\.?", line, flags=re.IGNORECASE):
             candidate["roll_no"], index = parse_roll_no_block(lines, index)
             continue
+
+        if pending_exam_set:
+            set_option_header = parse_set_option_header(line)
+            if set_option_header is not None:
+                current_options = set_option_header
+                index += 1
+                continue
 
         option_header = parse_option_header(line)
         if option_header is not None:
@@ -311,11 +483,11 @@ def parse_omr_text(ocr_text: str) -> dict[str, Any]:
 
         marker_row = is_marker_only_row(line)
         if marker_row is not None and pending_exam_set:
-            options = current_options or generated_options(len(marker_row))
+            options = current_options or DEFAULT_SET_OPTIONS[: len(marker_row)]
             selection = select_from_marks(options, marker_row)
             candidate["exam_set"] = {
-                "options": options if len(options) == len(marker_row) else generated_options(len(marker_row)),
-                "selected": selection.selected,
+                "options": options if len(options) == len(marker_row) else DEFAULT_SET_OPTIONS[: len(marker_row)],
+                "selected": normalize_marked_set_selection(selection.selected),
                 "status": selection.status,
             }
             pending_exam_set = False
@@ -495,7 +667,8 @@ def parse_simple_submission_text(ocr_text: str) -> dict[str, Any]:
     candidate: dict[str, Any] = {
         "name": extract_name(ocr_text),
         "email": extract_email(ocr_text),
-        "exam_set": extract_set_name(ocr_text),
+        "roll_no": extract_roll_no(ocr_text),
+        "exam_set": extract_marked_set_name(ocr_text) or extract_set_name(ocr_text),
     }
 
     for raw_line in ocr_text.splitlines():
@@ -572,6 +745,8 @@ def answer_key_from_csv(csv_path: str | Path, set_name: str) -> dict[str, Any]:
             choice = _first_present(row, ("Answer Choice Label", "Answer Label", "Correct Option", "Answer Choice"))
             marks = _first_present(row, ("Marks", "Mark", "Score", "Weight"))
             if question_id is None or choice is None or marks is None:
+                if question_id is None and choice is None:
+                    continue
                 raise ValueError(f"Missing question, answer label, or marks in CSV row {row_number}")
             if not is_choice_label(choice) and is_choice_label(row.get("A")):
                 choice = row.get("A")
@@ -635,6 +810,18 @@ def candidate_set_name(parsed: dict[str, Any]) -> str | None:
     return str(value).strip() if value not in (None, "") else None
 
 
+def candidate_roll_no(parsed: dict[str, Any]) -> str | None:
+    return normalize_roll_no(parsed.get("candidate", {}).get("roll_no"))
+
+
+def identity_warnings(parsed: dict[str, Any]) -> list[str]:
+    warnings: list[str] = []
+    roll_no = candidate_roll_no(parsed)
+    if roll_no and not re.fullmatch(r"\d{2}[A-Z]{2}\d{4}", roll_no):
+        warnings.append("roll_no should be reviewed")
+    return warnings
+
+
 def score_submission(parsed: dict[str, Any], answer_key_payload: dict[str, Any]) -> dict[str, Any]:
     evaluation = evaluate_answers(
         parsed,
@@ -647,12 +834,14 @@ def score_submission(parsed: dict[str, Any], answer_key_payload: dict[str, Any])
     return {
         "name": candidate.get("name"),
         "email": candidate.get("email"),
+        "roll_no": candidate_roll_no(parsed),
         "set": candidate_set_name(parsed),
         "answered_questions": answered_questions,
         "total_questions": total_questions,
         "unanswered_questions": total_questions - answered_questions,
         "score": evaluation["score"],
         "max_score": evaluation["max_score"],
+        "identity_warnings": identity_warnings(parsed),
         "evaluation": evaluation,
     }
 
@@ -852,6 +1041,269 @@ def preprocess_image_for_ocr(image_path: str | Path, output_path: str | Path) ->
     output.parent.mkdir(parents=True, exist_ok=True)
     image.save(output, format="PNG")
     return output
+
+
+def crop_identity_header_for_ocr(image_path: str | Path, output_path: str | Path) -> Path:
+    image = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
+    width, height = image.size
+    crop_box = (
+        int(width * 0.10),
+        int(height * 0.12),
+        int(width * 0.90),
+        int(height * 0.26),
+    )
+    crop = image.crop(crop_box)
+    crop = crop.resize((crop.width * 3, crop.height * 3))
+    crop = ImageEnhance.Contrast(crop).enhance(1.6)
+    crop = ImageEnhance.Sharpness(crop).enhance(1.4)
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    crop.save(output, format="PNG")
+    return output
+
+
+def detect_marked_set_from_image(image_path: str | Path) -> str | None:
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return None
+
+    image = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
+    rgb = np.array(image)
+    height, width = rgb.shape[:2]
+    crop = rgb[int(height * 0.13) : int(height * 0.20), int(width * 0.60) : int(width * 0.90)]
+    if crop.size == 0:
+        return None
+
+    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+    circles = cv2.HoughCircles(
+        gray,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=max(18, crop.shape[1] // 12),
+        param1=80,
+        param2=18,
+        minRadius=max(6, crop.shape[0] // 12),
+        maxRadius=max(12, crop.shape[0] // 3),
+    )
+    if circles is None:
+        return None
+
+    detected = sorted(
+        [
+            circle
+            for circle in np.round(circles[0]).astype(int).tolist()
+            if crop.shape[1] * 0.20 < circle[0] < crop.shape[1] * 0.95
+        ],
+        key=lambda item: item[0],
+    )
+    if len(detected) < len(DEFAULT_SET_OPTIONS):
+        return None
+
+    hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
+    hue, saturation, value = cv2.split(hsv)
+    marked = ((hue > 90) & (hue < 140) & (saturation > 45) & (value < 205)) | (
+        (value < 70) & (saturation > 25)
+    )
+
+    candidate_scores: list[float] = []
+    for x, y, radius in detected:
+        mask = np.zeros(gray.shape, dtype=np.uint8)
+        cv2.circle(mask, (x, y), max(3, int(radius * 0.55)), 255, -1)
+        pixels = marked[mask > 0]
+        candidate_scores.append(float(pixels.mean()) if pixels.size else 0.0)
+
+    if len(detected) > len(DEFAULT_SET_OPTIONS):
+        filled_index = max(range(len(candidate_scores)), key=candidate_scores.__getitem__)
+        best_group: list[list[int]] | None = None
+        best_score = float("inf")
+        for group_indexes in itertools.combinations(range(len(detected)), len(DEFAULT_SET_OPTIONS)):
+            if filled_index not in group_indexes:
+                continue
+            group = [detected[index] for index in group_indexes]
+            group = sorted(group, key=lambda circle: circle[0])
+            gaps = [group[position + 1][0] - group[position][0] for position in range(len(group) - 1)]
+            gap_score = float(np.std(gaps))
+            y_score = float(np.std([circle[1] for circle in group]))
+            score = gap_score + y_score
+            if score < best_score:
+                best_score = score
+                best_group = group
+        detected = best_group or detected[-len(DEFAULT_SET_OPTIONS) :]
+
+    scores: list[float] = []
+    for x, y, radius in detected:
+        mask = np.zeros(gray.shape, dtype=np.uint8)
+        cv2.circle(mask, (x, y), max(3, int(radius * 0.55)), 255, -1)
+        pixels = marked[mask > 0]
+        scores.append(float(pixels.mean()) if pixels.size else 0.0)
+
+    selected_index = max(range(len(scores)), key=scores.__getitem__)
+    if scores[selected_index] < 0.25:
+        return None
+    return normalize_ocr_set_name(DEFAULT_SET_OPTIONS[selected_index])
+
+
+def detect_answers_from_image(image_path: str | Path) -> list[dict[str, Any]]:
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return []
+
+    image = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
+    rgb = np.array(image)
+    height, width = rgb.shape[:2]
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    circles = cv2.HoughCircles(
+        gray,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=max(25, int(width * 0.04)),
+        param1=80,
+        param2=24,
+        minRadius=max(8, int(width * 0.008)),
+        maxRadius=max(20, int(width * 0.025)),
+    )
+    if circles is None:
+        return []
+
+    detected = np.round(circles[0]).astype(int).tolist()
+    detected = [
+        circle
+        for circle in detected
+        if height * 0.30 < circle[1] < height * 0.93 and width * 0.04 < circle[0] < width * 0.86
+    ]
+    detected = sorted(detected, key=lambda circle: (circle[1], circle[0]))
+
+    rows: list[list[list[int]]] = []
+    for circle in detected:
+        if not rows or abs(float(np.median([item[1] for item in rows[-1]])) - circle[1]) > height * 0.035:
+            rows.append([circle])
+        else:
+            rows[-1].append(circle)
+
+    cleaned_rows: list[list[list[int]]] = []
+    for row in rows:
+        if len(row) > 8:
+            median_y = float(np.median([circle[1] for circle in row]))
+            row = [circle for circle in row if abs(circle[1] - median_y) <= height * 0.02]
+        if len(row) >= 8:
+            cleaned_rows.append(row)
+    rows = cleaned_rows[:8]
+    if len(rows) < 6:
+        return []
+
+    grouped_rows: list[tuple[list[list[int]], list[list[int]]]] = []
+    right_refs: list[list[int]] = []
+    for row in rows:
+        row = sorted(row, key=lambda circle: circle[0])
+        xs = [circle[0] for circle in row]
+        valid_splits = [
+            (xs[index + 1] - xs[index], index + 1)
+            for index in range(len(xs) - 1)
+            if index + 1 >= 4 and len(xs) - (index + 1) >= 4
+        ]
+        if not valid_splits:
+            continue
+        split_index = max(valid_splits, key=lambda item: item[0])[1]
+        left = row[:split_index]
+        right = row[split_index:]
+        if len(right) == 4:
+            right_refs.append([circle[0] for circle in right])
+        grouped_rows.append((left, right))
+
+    right_ref = np.median(np.array(right_refs), axis=0) if right_refs else None
+
+    def pick_four(candidates: list[list[int]], side: str) -> list[list[int]]:
+        candidates = sorted(candidates, key=lambda circle: circle[0])
+        if len(candidates) < 4:
+            return []
+        if len(candidates) == 4:
+            return candidates
+        if side == "left":
+            return candidates[-4:]
+        if right_ref is not None:
+            best_group: list[list[int]] = []
+            best_score = float("inf")
+            for index in range(len(candidates) - 3):
+                group = candidates[index : index + 4]
+                score = sum(abs(group[position][0] - right_ref[position]) for position in range(4))
+                if score < best_score:
+                    best_score = score
+                    best_group = group
+            return best_group
+        return candidates[:4]
+
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    hue, saturation, value = cv2.split(hsv)
+    marked = ((hue > 90) & (hue < 140) & (saturation > 45) & (value < 205)) | (
+        (value < 70) & (saturation > 25)
+    )
+
+    answers_by_id: dict[str, dict[str, Any]] = {}
+    for row_index, (left_candidates, right_candidates) in enumerate(grouped_rows[:8]):
+        for question_id, candidates in (
+            (str(row_index + 1), pick_four(left_candidates, "left")),
+            (str(row_index + 9), pick_four(right_candidates, "right")),
+        ):
+            if len(candidates) != 4:
+                continue
+            option_scores: list[float] = []
+            for x, y, radius in sorted(candidates, key=lambda circle: circle[0]):
+                mask = np.zeros(gray.shape, dtype=np.uint8)
+                cv2.circle(mask, (x, y), max(3, int(radius * 0.52)), 255, -1)
+                pixels = marked[mask > 0]
+                option_scores.append(float(pixels.mean()) if pixels.size else 0.0)
+
+            selected_options = [
+                OPTION_LETTERS[index]
+                for index, score in enumerate(option_scores)
+                if score > 0.25
+            ]
+            if not selected_options:
+                selected: str | list[str] | None = None
+                status = "unmarked"
+            elif len(selected_options) == 1:
+                selected = selected_options[0]
+                status = "answered"
+            else:
+                selected = selected_options
+                status = "multiple"
+
+            answers_by_id[question_id] = {
+                "question_id": question_id,
+                "options": list(OPTION_LETTERS[:4]),
+                "selected": selected,
+                "status": status,
+                "source": "image",
+            }
+
+    return [
+        answers_by_id[question_id]
+        for question_id in sorted(answers_by_id, key=lambda value: int(value) if value.isdigit() else value)
+    ]
+
+
+def call_lighton_identity_ocr_image(
+    image_path: str | Path,
+    base_url: str,
+    model: str,
+    api_key: str | None = None,
+    timeout_seconds: int = 120,
+) -> str:
+    with tempfile.TemporaryDirectory(prefix="omr_identity_") as temp_dir:
+        crop_path = crop_identity_header_for_ocr(image_path, Path(temp_dir) / "identity-header.png")
+        return call_lighton_chat_ocr_image(
+            crop_path,
+            base_url,
+            model,
+            api_key=api_key,
+            timeout_seconds=timeout_seconds,
+            max_tokens=1024,
+        )
 
 
 def call_lighton_chat_ocr_image(
