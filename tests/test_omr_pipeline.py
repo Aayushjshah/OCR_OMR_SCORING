@@ -215,6 +215,18 @@ Roll No.: 23EE0446
         self.assertEqual(parsed["candidate"]["email"], "SARAVANAPRABHUI.EEE2023@CITCHENNAI.NET")
         self.assertEqual(parsed["candidate"]["roll_no"], "23E5046")
 
+    def test_parse_identity_table_without_set_preserves_roll_no(self):
+        parsed = parse_submission_text(
+            """<table>
+  <tr><td>Name:</td><td>Sabaresh C</td><td>Sat No.:</td><td>1</td><td>2</td></tr>
+  <tr><td>Email ID:</td><td>SABARESHC.CSE2023@CITCHENNAI.NET</td><td>Roll No.:</td><td>2100010773</td></tr>
+</table>"""
+        )
+
+        self.assertEqual(parsed["candidate"]["name"], "Sabaresh C")
+        self.assertEqual(parsed["candidate"]["email"], "SABARESHC.CSE2023@CITCHENNAI.NET")
+        self.assertEqual(parsed["candidate"]["roll_no"], "2100010773")
+
     def test_detect_marked_set_from_image(self):
         with TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "set.png"

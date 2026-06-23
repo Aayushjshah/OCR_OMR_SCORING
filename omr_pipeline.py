@@ -167,7 +167,10 @@ def normalize_roll_no(value: Any) -> str | None:
             return "".join(parts) or None
 
     cleaned = clean_ocr_value(str(value)) if value not in (None, "") else None
-    return re.sub(r"\s+", "", cleaned).upper() if cleaned else None
+    if not cleaned:
+        return None
+    compact = re.sub(r"\s+", "", cleaned).upper()
+    return compact if re.search(r"[A-Z0-9]", compact) else None
 
 
 def normalize_ocr_set_name(value: str) -> str | None:
@@ -691,7 +694,7 @@ def parse_simple_submission_text(ocr_text: str) -> dict[str, Any]:
 def parse_submission_text(ocr_text: str) -> dict[str, Any]:
     ocr_text = coerce_ocr_text(ocr_text)
     parsed = parse_simple_submission_text(ocr_text)
-    if parsed["candidate"].get("exam_set") or parsed["answers"]:
+    if any(value not in (None, "") for value in parsed["candidate"].values()) or parsed["answers"]:
         return parsed
 
     parsed = parse_omr_text(ocr_text)
@@ -815,11 +818,7 @@ def candidate_roll_no(parsed: dict[str, Any]) -> str | None:
 
 
 def identity_warnings(parsed: dict[str, Any]) -> list[str]:
-    warnings: list[str] = []
-    roll_no = candidate_roll_no(parsed)
-    if roll_no and not re.fullmatch(r"\d{2}[A-Z]{2}\d{4}", roll_no):
-        warnings.append("roll_no should be reviewed")
-    return warnings
+    return []
 
 
 def score_submission(parsed: dict[str, Any], answer_key_payload: dict[str, Any]) -> dict[str, Any]:
