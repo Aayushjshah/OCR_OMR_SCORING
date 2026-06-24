@@ -52,6 +52,7 @@ MAX_COMBINED_PDF_PAGES = int(os.environ.get("OMR_MAX_COMBINED_PDF_PAGES", "250")
 MAX_FOLDER_UPLOAD_BYTES = int(os.environ.get("OMR_MAX_FOLDER_UPLOAD_MB", "40")) * 1024 * 1024
 MAX_FOLDER_UPLOAD_FILES = int(os.environ.get("OMR_MAX_FOLDER_UPLOAD_FILES", "250"))
 ESTIMATED_SECONDS_PER_PAGE = int(os.environ.get("OMR_ESTIMATED_SECONDS_PER_PAGE", "15"))
+MANUAL_SET_NUMBERS = ("1", "2", "3", "4")
 
 app = FastAPI(title="OMR Evaluation Service")
 BATCH_JOBS: dict[str, dict[str, Any]] = {}
@@ -140,6 +141,13 @@ def validate_upload_batch(files: list[UploadFile]) -> int:
     return total_bytes
 
 
+def normalize_manual_set(set_number: str) -> str:
+    selected = str(set_number).strip()
+    if selected not in MANUAL_SET_NUMBERS:
+        raise ValueError("Set must be one of 1, 2, 3, or 4")
+    return f"set{selected}"
+
+
 def create_batch_job(total_files: int, batch: str) -> str:
     job_id = uuid.uuid4().hex
     now = time.time()
@@ -215,9 +223,12 @@ def score_ocr_text(
     ocr_text: str,
     identity_ocr_text: str | None = None,
     image_path: Path | None = None,
+    set_override: str | None = None,
 ) -> dict[str, Any]:
     parsed = parse_submission_text(ocr_text)
     merge_identity_candidate(parsed, identity_ocr_text=identity_ocr_text, image_path=image_path)
+    if set_override:
+        parsed.setdefault("candidate", {})["exam_set"] = set_override
     set_name = candidate_set_name(parsed)
     if not set_name:
         raise ValueError("Set is missing from OCR output")
@@ -225,7 +236,7 @@ def score_ocr_text(
     return score_submission(parsed, answer_key)
 
 
-def score_path(path: Path) -> dict[str, Any]:
+def score_path(path: Path, set_override: str | None = None) -> dict[str, Any]:
     if path.suffix.lower() not in SUPPORTED_DOCUMENT_SUFFIXES:
         raise ValueError(f"Unsupported file type: {path.suffix}")
 
@@ -257,7 +268,12 @@ def score_path(path: Path) -> dict[str, Any]:
                 api_key=OCR_API_KEY,
                 timeout_seconds=OCR_TIMEOUT,
             )
-            result = score_ocr_text(ocr_text, identity_ocr_text=identity_ocr_text, image_path=identity_image_path)
+            result = score_ocr_text(
+                ocr_text,
+                identity_ocr_text=identity_ocr_text,
+                image_path=identity_image_path,
+                set_override=set_override,
+            )
     else:
         ocr_text = call_lighton_chat_ocr_file(
             path,
@@ -276,7 +292,12 @@ def score_path(path: Path) -> dict[str, Any]:
                 api_key=OCR_API_KEY,
                 timeout_seconds=OCR_TIMEOUT,
             )
-        result = score_ocr_text(ocr_text, identity_ocr_text=identity_ocr_text, image_path=identity_image_path)
+        result = score_ocr_text(
+            ocr_text,
+            identity_ocr_text=identity_ocr_text,
+            image_path=identity_image_path,
+            set_override=set_override,
+        )
 
     stamp = int(time.time() * 1000)
     base = safe_filename(path.stem)
@@ -374,7 +395,7 @@ def index() -> str:
     section h2 {{ margin: 0 0 14px; font-size: 16px; letter-spacing: 0; }}
     label {{ display: block; margin: 12px 0 6px; font-size: 13px; color: var(--muted); }}
     .hint {{ margin: 6px 0 0; color: var(--muted); font-size: 12px; line-height: 1.4; }}
-    input[type="text"], input[type="file"] {{
+    input[type="text"], input[type="file"], select {{
       width: 100%;
       border: 1px solid var(--line);
       border-radius: 6px;
@@ -461,6 +482,21 @@ def index() -> str:
             <label for="sheet-file">Image, PDF, or OCR text</label>
             <input id="sheet-file" name="file" type="file" accept=".png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff,.pdf,.txt,.json" required>
             <button type="submit">Score File</button>
+          </form>
+        </section>
+        <section>
+          <h2>Score File By Set</h2>
+          <form id="manual-set-file-form">
+            <label for="manual-set-file">Image, PDF, or OCR text</label>
+            <input id="manual-set-file" name="file" type="file" accept=".png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff,.pdf,.txt,.json" required>
+            <label for="manual-set-number">Set</label>
+            <select id="manual-set-number" name="set_number" required>
+              <option value="1">Set 1</option>
+              <option value="2">Set 2</option>
+              <option value="3">Set 3</option>
+              <option value="4">Set 4</option>
+            </select>
+            <button type="submit">Score Selected Set</button>
           </form>
         </section>
         <section>
@@ -694,6 +730,10 @@ def index() -> str:
       event.preventDefault();
       postForm(event.currentTarget, '/api/score-file');
     }});
+    document.getElementById('manual-set-file-form').addEventListener('submit', event => {{
+      event.preventDefault();
+      postForm(event.currentTarget, '/api/score-file-with-set');
+    }});
     document.getElementById('folder-form').addEventListener('submit', event => {{
       event.preventDefault();
       postFolderForm(event.currentTarget);
@@ -730,6 +770,21 @@ async def score_file(file: UploadFile = File(...)) -> JSONResponse:
     saved = await save_upload(file, "submissions")
     try:
         result = score_path(saved)
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return JSONResponse({"source": str(saved), **result})
+
+
+@app.post("/api/score-file-with-set")
+async def score_file_with_set(set_number: str = Form(...), file: UploadFile = File(...)) -> JSONResponse:
+    try:
+        set_override = normalize_manual_set(set_number)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+    saved = await save_upload(file, "manual_set_submissions")
+    try:
+        result = score_path(saved, set_override=set_override)
     except Exception as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return JSONResponse({"source": str(saved), **result})

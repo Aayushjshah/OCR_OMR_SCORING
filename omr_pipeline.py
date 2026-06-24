@@ -1028,19 +1028,50 @@ def layout_orientation_score(image: Image.Image) -> float:
     answered_count = sum(1 for answer in answers if answer.get("selected") is not None)
     set_bonus = 8 if _detect_marked_set_from_rgb(rgb) else 0
     portrait_bonus = 2 if height > width else 0
-    return float((len(answers) * 10) + answered_count + set_bonus + portrait_bonus)
+    header_bonus = _layout_upright_header_score(rgb)
+    return float((len(answers) * 10) + answered_count + set_bonus + portrait_bonus + header_bonus)
+
+
+def _layout_upright_header_score(rgb: Any) -> float:
+    """Favor orientations with the title/identity header at the top of the page."""
+    marked = _marked_pixel_mask(rgb)
+    if marked is None or marked.size == 0:
+        return 0.0
+
+    height, width = marked.shape[:2]
+
+    def fraction(x0: float, y0: float, x1: float, y1: float) -> float:
+        region = marked[int(height * y0) : int(height * y1), int(width * x0) : int(width * x1)]
+        return float(region.mean()) if region.size else 0.0
+
+    title_density = fraction(0.20, 0.05, 0.80, 0.13)
+    identity_density = fraction(0.08, 0.12, 0.92, 0.26)
+    set_density = fraction(0.65, 0.12, 0.90, 0.18)
+    footer_density = fraction(0.08, 0.88, 0.92, 0.97)
+
+    return (
+        (title_density * 220.0)
+        + (identity_density * 75.0)
+        + (set_density * 120.0)
+        - (footer_density * 180.0)
+    )
 
 
 def _marked_pixel_mask(rgb: Any) -> Any | None:
     try:
         import cv2
+        import numpy as np
     except ImportError:
         return None
 
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
     hue, saturation, value = cv2.split(hsv)
     blue_or_purple_ink = (hue > 90) & (hue < 145) & (saturation > 35) & (value < 215)
-    dark_ink = value < 85
+    dark_threshold = 85.0
+    if float(np.percentile(value, 1)) > dark_threshold:
+        otsu_threshold, _ = cv2.threshold(value, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        dark_threshold = min(185.0, max(dark_threshold, float(otsu_threshold)))
+    dark_ink = value < dark_threshold
     return blue_or_purple_ink | dark_ink
 
 

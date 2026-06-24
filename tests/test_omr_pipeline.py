@@ -12,8 +12,10 @@ from app import (
     estimated_combined_pdf_seconds,
     format_duration,
     get_batch_job,
+    normalize_manual_set,
     process_saved_upload_batch_job,
     row_from_result,
+    score_ocr_text,
     validate_combined_pdf,
     validate_folder_upload_limits,
 )
@@ -179,6 +181,44 @@ Set: set1
         self.assertEqual(result["unanswered_questions"], 0)
         self.assertEqual(result["score"], 5.0)
         self.assertEqual(result["max_score"], 8.0)
+
+    def test_score_ocr_text_without_override_uses_detected_set(self):
+        result = score_ocr_text(
+            """Name: Manual Candidate
+Email: manual@example.com
+Roll No.: 23EE0446
+Set: set1
+1: A
+"""
+        )
+
+        self.assertEqual(result["set"], "set1")
+        self.assertEqual(result["score"], 0.0)
+        self.assertFalse(result["evaluation"]["details"][0]["is_correct"])
+
+    def test_score_ocr_text_override_uses_selected_set(self):
+        result = score_ocr_text(
+            """Name: Manual Candidate
+Email: manual@example.com
+Roll No.: 23EE0446
+Set: set1
+1: A
+""",
+            set_override=normalize_manual_set("2"),
+        )
+
+        self.assertEqual(result["set"], "set2")
+        self.assertEqual(result["score"], 3.0)
+        self.assertTrue(result["evaluation"]["details"][0]["is_correct"])
+
+    def test_normalize_manual_set_rejects_invalid_values(self):
+        self.assertEqual(normalize_manual_set("1"), "set1")
+        self.assertEqual(normalize_manual_set(" 4 "), "set4")
+
+        for value in ("", "0", "5", "set5"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    normalize_manual_set(value)
 
     def test_parse_final_layout_marked_set_and_roll_no(self):
         parsed = parse_submission_text(
