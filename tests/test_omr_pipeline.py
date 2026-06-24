@@ -286,6 +286,58 @@ Roll No.: 23EE0446
 
             self.assertEqual(answers, selections)
 
+    def test_detect_answers_and_set_from_rotated_image(self):
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "rotated_answers.png"
+            image = Image.new("RGB", (1200, 1600), "white")
+            set_centers = [(835, 277), (871, 278), (914, 279), (952, 282)]
+            left_xs = [260, 320, 380, 440]
+            right_xs = [700, 760, 820, 880]
+            row_ys = [515, 628, 745, 865, 990, 1121, 1257, 1396]
+            selections = {
+                "1": "C",
+                "2": "B",
+                "3": "A",
+                "4": "B",
+                "5": "C",
+                "6": "B",
+                "7": "C",
+                "8": "B",
+                "9": "B",
+                "10": "B",
+                "11": "B",
+                "12": "C",
+                "13": "A",
+                "14": "C",
+                "15": "B",
+                "16": "C",
+            }
+            for index, (x, y) in enumerate(set_centers):
+                for dx in range(-13, 14):
+                    for dy in range(-13, 14):
+                        distance = (dx * dx + dy * dy) ** 0.5
+                        if 11 <= distance <= 13:
+                            image.putpixel((x + dx, y + dy), (0, 0, 0))
+                        elif index == 2 and distance <= 9:
+                            image.putpixel((x + dx, y + dy), (5, 5, 5))
+            for row_index, y in enumerate(row_ys):
+                for question_id, xs in ((str(row_index + 1), left_xs), (str(row_index + 9), right_xs)):
+                    selected = selections[question_id]
+                    for option_index, x in enumerate(xs):
+                        for dx in range(-18, 19):
+                            for dy in range(-18, 19):
+                                distance = (dx * dx + dy * dy) ** 0.5
+                                if 16 <= distance <= 18:
+                                    image.putpixel((x + dx, y + dy), (0, 0, 0))
+                                elif OPTION_LETTERS[option_index] == selected and distance <= 13:
+                                    image.putpixel((x + dx, y + dy), (5, 5, 5))
+            image.rotate(90, expand=True).save(path)
+
+            answers = {answer["question_id"]: answer["selected"] for answer in detect_answers_from_image(path)}
+
+            self.assertEqual(detect_marked_set_from_image(path), "set3")
+            self.assertEqual(answers, selections)
+
     def test_set_marker_row_defaults_to_numbered_sets(self):
         parsed = parse_omr_text(
             """Set No.

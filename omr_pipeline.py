@@ -25,6 +25,7 @@ import csv
 import html as html_lib
 import itertools
 import json
+import math
 import mimetypes
 import os
 import re
@@ -1000,8 +1001,51 @@ def find_chat_message_content(payload: Any) -> str | None:
     return find_text_value(payload)
 
 
-def preprocess_image_for_ocr(image_path: str | Path, output_path: str | Path) -> Path:
+def load_omr_layout_image(image_path: str | Path) -> Image.Image:
     image = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
+    return normalize_omr_layout_orientation(image)
+
+
+def normalize_omr_layout_orientation(image: Image.Image) -> Image.Image:
+    variants = [(angle, image.rotate(angle, expand=True) if angle else image) for angle in (0, 90, 180, 270)]
+    scored_variants = [(layout_orientation_score(variant), angle, variant) for angle, variant in variants]
+    best_score, _, best_image = max(scored_variants, key=lambda item: (item[0], -item[1]))
+    original_score = scored_variants[0][0]
+    if best_score <= 0 or best_score == original_score:
+        return image
+    return best_image
+
+
+def layout_orientation_score(image: Image.Image) -> float:
+    try:
+        import numpy as np
+    except ImportError:
+        return 0.0
+
+    width, height = image.size
+    rgb = np.array(image)
+    answers = _detect_answers_from_rgb(rgb)
+    answered_count = sum(1 for answer in answers if answer.get("selected") is not None)
+    set_bonus = 8 if _detect_marked_set_from_rgb(rgb) else 0
+    portrait_bonus = 2 if height > width else 0
+    return float((len(answers) * 10) + answered_count + set_bonus + portrait_bonus)
+
+
+def _marked_pixel_mask(rgb: Any) -> Any | None:
+    try:
+        import cv2
+    except ImportError:
+        return None
+
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    hue, saturation, value = cv2.split(hsv)
+    blue_or_purple_ink = (hue > 90) & (hue < 145) & (saturation > 35) & (value < 215)
+    dark_ink = value < 85
+    return blue_or_purple_ink | dark_ink
+
+
+def preprocess_image_for_ocr(image_path: str | Path, output_path: str | Path) -> Path:
+    image = load_omr_layout_image(image_path)
 
     try:
         import cv2
@@ -1043,7 +1087,7 @@ def preprocess_image_for_ocr(image_path: str | Path, output_path: str | Path) ->
 
 
 def crop_identity_header_for_ocr(image_path: str | Path, output_path: str | Path) -> Path:
-    image = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
+    image = load_omr_layout_image(image_path)
     width, height = image.size
     crop_box = (
         int(width * 0.10),
@@ -1063,20 +1107,30 @@ def crop_identity_header_for_ocr(image_path: str | Path, output_path: str | Path
 
 
 def detect_marked_set_from_image(image_path: str | Path) -> str | None:
+    image = load_omr_layout_image(image_path)
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+
+    return _detect_marked_set_from_rgb(np.array(image))
+
+
+def _detect_marked_set_from_rgb(rgb: Any) -> str | None:
     try:
         import cv2
         import numpy as np
     except ImportError:
         return None
 
-    image = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
-    rgb = np.array(image)
     height, width = rgb.shape[:2]
-    crop = rgb[int(height * 0.13) : int(height * 0.20), int(width * 0.60) : int(width * 0.90)]
+    crop = rgb[int(height * 0.12) : int(height * 0.26), int(width * 0.58) : int(width * 0.91)]
     if crop.size == 0:
         return None
 
     gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+    min_radius = max(6, int(width * 0.008))
+    max_radius = max(12, int(width * 0.025))
     circles = cv2.HoughCircles(
         gray,
         cv2.HOUGH_GRADIENT,
@@ -1084,76 +1138,123 @@ def detect_marked_set_from_image(image_path: str | Path) -> str | None:
         minDist=max(18, crop.shape[1] // 12),
         param1=80,
         param2=18,
-        minRadius=max(6, crop.shape[0] // 12),
-        maxRadius=max(12, crop.shape[0] // 3),
+        minRadius=min_radius,
+        maxRadius=max_radius,
     )
-    if circles is None:
+
+    marked = _marked_pixel_mask(crop)
+    if marked is None:
         return None
 
-    detected = sorted(
-        [
-            circle
-            for circle in np.round(circles[0]).astype(int).tolist()
-            if crop.shape[1] * 0.20 < circle[0] < crop.shape[1] * 0.95
-        ],
-        key=lambda item: item[0],
-    )
-    if len(detected) < len(DEFAULT_SET_OPTIONS):
+    candidates: list[dict[str, float | str]] = []
+
+    def add_candidate(x: float, y: float, radius: float, source: str) -> None:
+        if not (crop.shape[1] * 0.20 < x < crop.shape[1] * 0.95):
+            return
+        for existing in candidates:
+            distance = ((float(existing["x"]) - x) ** 2 + (float(existing["y"]) - y) ** 2) ** 0.5
+            if distance <= max(9.0, (float(existing["radius"]) + radius) * 0.45):
+                if source == "filled":
+                    existing["x"] = x
+                    existing["y"] = y
+                else:
+                    existing["x"] = (float(existing["x"]) + x) / 2
+                    existing["y"] = (float(existing["y"]) + y) / 2
+                existing["radius"] = max(float(existing["radius"]), radius)
+                existing["source"] = f"{existing['source']},{source}"
+                return
+        candidates.append({"x": x, "y": y, "radius": radius, "source": source})
+
+    if circles is not None:
+        for x, y, radius in np.round(circles[0]).astype(int).tolist():
+            add_candidate(float(x), float(y), float(radius), "outline")
+
+    component_mask = (marked.astype(np.uint8) * 255)
+    component_mask = cv2.morphologyEx(component_mask, cv2.MORPH_OPEN, np.ones((3, 3), dtype=np.uint8))
+    component_count, _, stats, centroids = cv2.connectedComponentsWithStats(component_mask, 8)
+    min_area = math.pi * (min_radius * 0.45) ** 2
+    max_area = math.pi * (max_radius * 1.15) ** 2
+    for component_index in range(1, component_count):
+        x, y, component_width, component_height, area = stats[component_index]
+        center_x, center_y = centroids[component_index]
+        if not (min_area <= area <= max_area):
+            continue
+        if component_width < min_radius * 0.8 or component_height < min_radius * 0.8:
+            continue
+        if component_width > max_radius * 2.4 or component_height > max_radius * 2.4:
+            continue
+        aspect_ratio = component_width / float(component_height)
+        if not (0.55 <= aspect_ratio <= 1.85):
+            continue
+        add_candidate(float(center_x), float(center_y), float(max(component_width, component_height) / 2), "filled")
+
+    if len(candidates) < len(DEFAULT_SET_OPTIONS):
         return None
 
-    hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
-    hue, saturation, value = cv2.split(hsv)
-    marked = ((hue > 90) & (hue < 140) & (saturation > 45) & (value < 205)) | (
-        (value < 70) & (saturation > 25)
-    )
+    def fill_scores(group: tuple[dict[str, float | str], ...]) -> list[float]:
+        scores: list[float] = []
+        for candidate in sorted(group, key=lambda item: float(item["x"])):
+            x = int(round(float(candidate["x"])))
+            y = int(round(float(candidate["y"])))
+            radius = float(candidate["radius"])
+            mask = np.zeros(gray.shape, dtype=np.uint8)
+            cv2.circle(mask, (x, y), max(3, int(radius * 0.60)), 255, -1)
+            pixels = marked[mask > 0]
+            scores.append(float(pixels.mean()) if pixels.size else 0.0)
+        return scores
 
-    candidate_scores: list[float] = []
-    for x, y, radius in detected:
-        mask = np.zeros(gray.shape, dtype=np.uint8)
-        cv2.circle(mask, (x, y), max(3, int(radius * 0.55)), 255, -1)
-        pixels = marked[mask > 0]
-        candidate_scores.append(float(pixels.mean()) if pixels.size else 0.0)
+    best_group: tuple[dict[str, float | str], ...] | None = None
+    best_group_score = -float("inf")
+    best_scores: list[float] = []
+    for group in itertools.combinations(candidates, len(DEFAULT_SET_OPTIONS)):
+        ordered = tuple(sorted(group, key=lambda item: float(item["x"])))
+        xs = [float(candidate["x"]) for candidate in ordered]
+        ys = [float(candidate["y"]) for candidate in ordered]
+        gaps = [xs[position + 1] - xs[position] for position in range(len(xs) - 1)]
+        mean_gap = float(np.mean(gaps))
+        if not (width * 0.022 <= mean_gap <= width * 0.075):
+            continue
+        if min(gaps) < mean_gap * 0.35 or max(gaps) > mean_gap * 1.90:
+            continue
+        y_spread = float(np.std(ys))
+        if y_spread > crop.shape[0] * 0.18:
+            continue
+        gap_spread = float(np.std(gaps))
+        scores = fill_scores(ordered)
+        group_score = (max(scores) * 60) - y_spread - gap_spread
+        if sum(score > 0.25 for score in scores) == 1:
+            group_score += 10
+        if group_score > best_group_score:
+            best_group_score = group_score
+            best_group = ordered
+            best_scores = scores
 
-    if len(detected) > len(DEFAULT_SET_OPTIONS):
-        filled_index = max(range(len(candidate_scores)), key=candidate_scores.__getitem__)
-        best_group: list[list[int]] | None = None
-        best_score = float("inf")
-        for group_indexes in itertools.combinations(range(len(detected)), len(DEFAULT_SET_OPTIONS)):
-            if filled_index not in group_indexes:
-                continue
-            group = [detected[index] for index in group_indexes]
-            group = sorted(group, key=lambda circle: circle[0])
-            gaps = [group[position + 1][0] - group[position][0] for position in range(len(group) - 1)]
-            gap_score = float(np.std(gaps))
-            y_score = float(np.std([circle[1] for circle in group]))
-            score = gap_score + y_score
-            if score < best_score:
-                best_score = score
-                best_group = group
-        detected = best_group or detected[-len(DEFAULT_SET_OPTIONS) :]
+    if best_group is None or not best_scores:
+        return None
 
-    scores: list[float] = []
-    for x, y, radius in detected:
-        mask = np.zeros(gray.shape, dtype=np.uint8)
-        cv2.circle(mask, (x, y), max(3, int(radius * 0.55)), 255, -1)
-        pixels = marked[mask > 0]
-        scores.append(float(pixels.mean()) if pixels.size else 0.0)
-
-    selected_index = max(range(len(scores)), key=scores.__getitem__)
-    if scores[selected_index] < 0.25:
+    selected_index = max(range(len(best_scores)), key=best_scores.__getitem__)
+    if best_scores[selected_index] < 0.25:
         return None
     return normalize_ocr_set_name(DEFAULT_SET_OPTIONS[selected_index])
 
 
 def detect_answers_from_image(image_path: str | Path) -> list[dict[str, Any]]:
+    image = load_omr_layout_image(image_path)
+    try:
+        import numpy as np
+    except ImportError:
+        return []
+
+    return _detect_answers_from_rgb(np.array(image))
+
+
+def _detect_answers_from_rgb(rgb: Any) -> list[dict[str, Any]]:
     try:
         import cv2
         import numpy as np
     except ImportError:
         return []
 
-    image = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
-    rgb = np.array(image)
     height, width = rgb.shape[:2]
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     circles = cv2.HoughCircles(
@@ -1236,11 +1337,9 @@ def detect_answers_from_image(image_path: str | Path) -> list[dict[str, Any]]:
             return best_group
         return candidates[:4]
 
-    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-    hue, saturation, value = cv2.split(hsv)
-    marked = ((hue > 90) & (hue < 140) & (saturation > 45) & (value < 205)) | (
-        (value < 70) & (saturation > 25)
-    )
+    marked = _marked_pixel_mask(rgb)
+    if marked is None:
+        return []
 
     answers_by_id: dict[str, dict[str, Any]] = {}
     for row_index, (left_candidates, right_candidates) in enumerate(grouped_rows[:8]):
