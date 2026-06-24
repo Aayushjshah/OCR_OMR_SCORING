@@ -1,14 +1,18 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from PIL import Image
 
 from app import (
     MAX_FOLDER_UPLOAD_BYTES,
     MAX_FOLDER_UPLOAD_FILES,
+    create_batch_job,
     estimated_combined_pdf_seconds,
     format_duration,
+    get_batch_job,
+    process_saved_upload_batch_job,
     row_from_result,
     validate_combined_pdf,
     validate_folder_upload_limits,
@@ -451,6 +455,38 @@ Email ID: *candidate 57@example.com*
 
         with self.assertRaises(ValueError):
             validate_folder_upload_limits(1, MAX_FOLDER_UPLOAD_BYTES + 1)
+
+    def test_background_batch_job_writes_csv(self):
+        with TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "sheet.jpg"
+            source.write_bytes(b"fake image")
+            result = {
+                "name": "Ada",
+                "email": "ada@example.com",
+                "roll_no": "23EE0446",
+                "set": "set1",
+                "answered_questions": 16,
+                "total_questions": 16,
+                "unanswered_questions": 0,
+                "score": 10,
+                "max_score": 16,
+                "identity_warnings": [],
+            }
+            job_id = create_batch_job(1, "batch_test")
+
+            with patch("app.OUTPUT_DIR", Path(temp_dir)), patch("app.score_path", return_value=result):
+                process_saved_upload_batch_job(job_id, [("sheet.jpg", source)])
+
+            job = get_batch_job(job_id)
+            self.assertIsNotNone(job)
+            assert job is not None
+            self.assertEqual(job["status"], "completed")
+            self.assertEqual(job["processed_files"], 1)
+            self.assertEqual(job["successful_files"], 1)
+            self.assertEqual(job["failed_files"], 0)
+            self.assertEqual(job["rows"][0]["roll_no"], "23EE0446")
+            self.assertTrue(Path(job["csv_path"]).exists())
+            self.assertTrue(job["download_url"].startswith("/api/download/upload_scores_"))
 
     def test_save_answer_key_json(self):
         with TemporaryDirectory() as temp_dir:

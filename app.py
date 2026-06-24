@@ -10,11 +10,13 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pypdf import PdfReader
 
@@ -52,6 +54,8 @@ MAX_FOLDER_UPLOAD_FILES = int(os.environ.get("OMR_MAX_FOLDER_UPLOAD_FILES", "250
 ESTIMATED_SECONDS_PER_PAGE = int(os.environ.get("OMR_ESTIMATED_SECONDS_PER_PAGE", "15"))
 
 app = FastAPI(title="OMR Evaluation Service")
+BATCH_JOBS: dict[str, dict[str, Any]] = {}
+BATCH_JOBS_LOCK = threading.Lock()
 
 
 def ensure_dirs() -> None:
@@ -134,6 +138,46 @@ def validate_upload_batch(files: list[UploadFile]) -> int:
     total_bytes = sum(upload_file_size(upload) for upload in files)
     validate_folder_upload_limits(len(files), total_bytes)
     return total_bytes
+
+
+def create_batch_job(total_files: int, batch: str) -> str:
+    job_id = uuid.uuid4().hex
+    now = time.time()
+    with BATCH_JOBS_LOCK:
+        BATCH_JOBS[job_id] = {
+            "job_id": job_id,
+            "batch": batch,
+            "status": "queued",
+            "total_files": total_files,
+            "processed_files": 0,
+            "successful_files": 0,
+            "failed_files": 0,
+            "current_file": "",
+            "csv_path": "",
+            "download_url": "",
+            "error": "",
+            "rows": [],
+            "created_at": now,
+            "updated_at": now,
+        }
+    return job_id
+
+
+def update_batch_job(job_id: str, **updates: Any) -> None:
+    with BATCH_JOBS_LOCK:
+        job = BATCH_JOBS.get(job_id)
+        if not job:
+            return
+        job.update(updates)
+        job["updated_at"] = time.time()
+
+
+def get_batch_job(job_id: str) -> dict[str, Any] | None:
+    with BATCH_JOBS_LOCK:
+        job = BATCH_JOBS.get(job_id)
+        if job is None:
+            return None
+        return dict(job)
 
 
 def validate_combined_pdf(path: Path) -> int:
@@ -494,6 +538,41 @@ def index() -> str:
       result.classList.remove('error');
       result.textContent = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
     }}
+    function renderBatchJob(job) {{
+      const lines = [
+        `Status: ${{job.status}}`,
+        `Processed: ${{job.processed_files}} / ${{job.total_files}} file(s)`,
+        `Successful: ${{job.successful_files}}`,
+        `Failed: ${{job.failed_files}}`
+      ];
+      if (job.current_file) {{
+        lines.push(`Current: ${{job.current_file}}`);
+      }}
+      if (job.error) {{
+        lines.push('', `Error: ${{job.error}}`);
+      }}
+      if (job.download_url) {{
+        lines.push('', `CSV: ${{window.location.origin + job.download_url}}`);
+      }}
+      if (job.rows && job.rows.length) {{
+        lines.push('', JSON.stringify(job.rows, null, 2));
+      }}
+      result.textContent = lines.join('\\n');
+    }}
+    async function pollBatchJob(jobId) {{
+      const response = await fetch(`/api/batch-jobs/${{encodeURIComponent(jobId)}}`, {{ cache: 'no-store' }});
+      const job = await response.json();
+      if (!response.ok) {{
+        result.classList.add('error');
+        result.textContent = JSON.stringify(job, null, 2);
+        return;
+      }}
+      result.classList.toggle('error', job.status === 'failed');
+      renderBatchJob(job);
+      if (job.status === 'queued' || job.status === 'running') {{
+        window.setTimeout(() => pollBatchJob(jobId), 2000);
+      }}
+    }}
     async function postFolderForm(form) {{
       const data = new FormData(form);
       const files = data.getAll('files');
@@ -532,16 +611,12 @@ def index() -> str:
           return;
         }}
         result.classList.remove('error');
-        const summary = [
-          `Done. Processed ${{payload.processed_files}} / ${{payload.total_files}} file(s).`,
-          `Successful: ${{payload.successful_files}}`,
-          `Failed: ${{payload.failed_files}}`,
-          '',
-          `CSV: ${{window.location.origin + payload.download_url}}`,
-          '',
-          JSON.stringify(payload.rows, null, 2)
-        ].join('\\n');
-        result.textContent = summary;
+        if (payload.job_id) {{
+          renderBatchJob(payload);
+          pollBatchJob(payload.job_id);
+          return;
+        }}
+        result.textContent = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
       }};
       xhr.onerror = () => {{
         result.classList.add('error');
@@ -684,6 +759,69 @@ async def process_upload_batch(files: list[UploadFile]) -> tuple[Path, list[dict
     return output_path, rows
 
 
+async def save_upload_batch(files: list[UploadFile]) -> tuple[str, list[tuple[str, Path]]]:
+    validate_upload_batch(files)
+    batch = f"batch_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+    saved_files: list[tuple[str, Path]] = []
+    for upload in files:
+        saved = await save_upload(upload, batch)
+        saved_files.append((upload.filename or saved.name, saved))
+    return batch, saved_files
+
+
+def process_saved_upload_batch_job(job_id: str, saved_files: list[tuple[str, Path]]) -> None:
+    rows: list[dict[str, Any]] = []
+    successful_files = 0
+    failed_files = 0
+    update_batch_job(job_id, status="running")
+    try:
+        for index, (original_name, saved) in enumerate(saved_files, start=1):
+            update_batch_job(
+                job_id,
+                current_file=original_name,
+                processed_files=index - 1,
+                successful_files=successful_files,
+                failed_files=failed_files,
+                rows=list(rows),
+            )
+            try:
+                result = score_path(saved)
+                row = row_from_result(original_name, result)
+                successful_files += 1
+            except Exception as error:
+                row = row_from_result(original_name, {}, str(error))
+                failed_files += 1
+            rows.append(row)
+            update_batch_job(
+                job_id,
+                processed_files=index,
+                successful_files=successful_files,
+                failed_files=failed_files,
+                rows=list(rows),
+            )
+
+        output_path = write_score_csv(rows, prefix="upload_scores")
+        update_batch_job(
+            job_id,
+            status="completed",
+            current_file="",
+            csv_path=str(output_path),
+            download_url=f"/api/download/{output_path.name}",
+            rows=rows,
+        )
+    except Exception as error:
+        output_path = write_score_csv(rows, prefix="upload_scores_partial") if rows else None
+        update_batch_job(
+            job_id,
+            status="failed",
+            current_file="",
+            error=str(error),
+            csv_path=str(output_path) if output_path else "",
+            download_url=f"/api/download/{output_path.name}" if output_path else "",
+            rows=rows,
+        )
+
+
 def process_combined_pdf(path: Path, original_name: str) -> tuple[Path, list[dict[str, Any]], int]:
     page_count = validate_combined_pdf(path)
     rows: list[dict[str, Any]] = []
@@ -719,23 +857,26 @@ def process_combined_pdf(path: Path, original_name: str) -> tuple[Path, list[dic
 
 
 @app.post("/api/score-upload-batch-json")
-async def score_upload_batch_json(files: list[UploadFile] = File(...)) -> JSONResponse:
+async def score_upload_batch_json(
+    background_tasks: BackgroundTasks,
+    files: list[UploadFile] = File(...),
+) -> JSONResponse:
     try:
-        output_path, rows = await process_upload_batch(files)
+        batch, saved_files = await save_upload_batch(files)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    failed_files = sum(1 for row in rows if row.get("error"))
-    return JSONResponse(
-        {
-            "total_files": len(files),
-            "processed_files": len(rows),
-            "successful_files": len(rows) - failed_files,
-            "failed_files": failed_files,
-            "csv_path": str(output_path),
-            "download_url": f"/api/download/{output_path.name}",
-            "rows": rows,
-        }
-    )
+    job_id = create_batch_job(len(saved_files), batch)
+    background_tasks.add_task(process_saved_upload_batch_job, job_id, saved_files)
+    job = get_batch_job(job_id)
+    return JSONResponse(job)
+
+
+@app.get("/api/batch-jobs/{job_id}")
+def batch_job_status(job_id: str) -> JSONResponse:
+    job = get_batch_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Batch job not found")
+    return JSONResponse(job)
 
 
 @app.post("/api/score-combined-pdf")
