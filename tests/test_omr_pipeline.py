@@ -1,3 +1,5 @@
+import threading
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -13,6 +15,7 @@ from app import (
     format_duration,
     get_batch_job,
     normalize_manual_set,
+    process_combined_pdf_job,
     process_saved_upload_batch_job,
     row_from_result,
     score_ocr_text,
@@ -247,6 +250,20 @@ Roll No.: 23EE0446
         self.assertEqual(row["roll_no"], "23EE0446")
         self.assertEqual(result["score"], 1.0)
 
+    def test_parse_latex_wrapped_identity_values(self):
+        parsed = parse_submission_text(
+            """Name: $\\text{NITHIN S}$
+Email ID: $\\text{ns2470@symist.edu.in}$
+Set No.: 4
+Roll No.: $\\TEXT{RA231104701014}$
+"""
+        )
+
+        self.assertEqual(parsed["candidate"]["name"], "NITHIN S")
+        self.assertEqual(parsed["candidate"]["email"], "ns2470@symist.edu.in")
+        self.assertEqual(parsed["candidate"]["exam_set"], "set4")
+        self.assertEqual(parsed["candidate"]["roll_no"], "RA231104701014")
+
     def test_parse_identity_from_cropped_ocr_table(self):
         parsed = parse_submission_text(
             """<table>
@@ -329,6 +346,130 @@ Roll No.: 23EE0446
             answers = {answer["question_id"]: answer["selected"] for answer in detect_answers_from_image(path)}
 
             self.assertEqual(answers, selections)
+
+    def test_detect_answers_includes_high_first_row(self):
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "answers_high_first_row.png"
+            image = Image.new("RGB", (1200, 1600), "white")
+            left_xs = [260, 320, 380, 440]
+            right_xs = [700, 760, 820, 880]
+            row_ys = [455, 585, 715, 845, 975, 1105, 1235, 1365]
+            selections = {
+                "1": "D",
+                "2": "A",
+                "3": "B",
+                "4": "C",
+                "5": "D",
+                "6": "A",
+                "7": "B",
+                "8": "C",
+                "9": "A",
+                "10": "B",
+                "11": "C",
+                "12": "D",
+                "13": "A",
+                "14": "B",
+                "15": "C",
+                "16": "D",
+            }
+            for row_index, y in enumerate(row_ys):
+                for question_id, xs in ((str(row_index + 1), left_xs), (str(row_index + 9), right_xs)):
+                    selected = selections[question_id]
+                    for option_index, x in enumerate(xs):
+                        for dx in range(-18, 19):
+                            for dy in range(-18, 19):
+                                distance = (dx * dx + dy * dy) ** 0.5
+                                if 16 <= distance <= 18:
+                                    image.putpixel((x + dx, y + dy), (0, 0, 0))
+                                elif OPTION_LETTERS[option_index] == selected and distance <= 13:
+                                    image.putpixel((x + dx, y + dy), (30, 35, 120))
+            image.save(path)
+
+            answers = {answer["question_id"]: answer["selected"] for answer in detect_answers_from_image(path)}
+
+            self.assertEqual(answers, selections)
+
+    def test_lalitha_scan_88_orientation_and_rows_when_available(self):
+        path = Path(
+            "/Users/aayush.shah/Downloads/OMR images/Archive 2/lalitha 2 folder/"
+            "Adobe Scan 24 Jun 2026 (88)_1.jpg"
+        )
+        if not path.exists():
+            self.skipTest("local Lalitha scan fixture is not available")
+
+        answers = {answer["question_id"]: answer["selected"] for answer in detect_answers_from_image(path)}
+
+        self.assertEqual(detect_marked_set_from_image(path), "set3")
+        self.assertEqual(len(answers), 16)
+        self.assertEqual(answers["1"], "C")
+        self.assertEqual(answers["8"], "C")
+        self.assertEqual(answers["16"], "B")
+
+    def test_detect_answers_ignores_instruction_circle_row(self):
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "answers_with_instruction_circles.png"
+            image = Image.new("RGB", (1200, 1600), "white")
+            left_xs = [260, 320, 380, 440]
+            right_xs = [700, 760, 820, 880]
+            row_ys = [570, 705, 840, 975, 1110, 1245, 1380, 1520]
+            selections = {
+                "1": "B",
+                "2": "D",
+                "3": "A",
+                "4": "C",
+                "5": "B",
+                "6": "D",
+                "7": "A",
+                "8": "C",
+                "9": "A",
+                "10": "D",
+                "11": "B",
+                "12": "C",
+                "13": "A",
+                "14": "D",
+                "15": "B",
+                "16": "C",
+            }
+            for x in [190, 260, 350, 430, 510, 590, 670, 760, 850]:
+                for dx in range(-17, 18):
+                    for dy in range(-17, 18):
+                        distance = (dx * dx + dy * dy) ** 0.5
+                        if 15 <= distance <= 17:
+                            image.putpixel((x + dx, 500 + dy), (0, 0, 0))
+            for row_index, y in enumerate(row_ys):
+                for question_id, xs in ((str(row_index + 1), left_xs), (str(row_index + 9), right_xs)):
+                    selected = selections[question_id]
+                    for option_index, x in enumerate(xs):
+                        for dx in range(-18, 19):
+                            for dy in range(-18, 19):
+                                distance = (dx * dx + dy * dy) ** 0.5
+                                if 16 <= distance <= 18:
+                                    image.putpixel((x + dx, y + dy), (0, 0, 0))
+                                elif OPTION_LETTERS[option_index] == selected and distance <= 13:
+                                    image.putpixel((x + dx, y + dy), (30, 35, 120))
+            image.save(path)
+
+            answers = {answer["question_id"]: answer["selected"] for answer in detect_answers_from_image(path)}
+
+            self.assertEqual(answers, selections)
+
+    def test_new_folder_scan_90_top_and_bottom_rows_when_available(self):
+        path = Path(
+            "/Users/aayush.shah/Downloads/OMR images/Archive 2/New Folder With Items 2/"
+            "Adobe Scan 24 Jun 2026 (90)_1.jpg"
+        )
+        if not path.exists():
+            self.skipTest("local New Folder scan fixture is not available")
+
+        answers = {answer["question_id"]: answer["selected"] for answer in detect_answers_from_image(path)}
+
+        self.assertEqual(detect_marked_set_from_image(path), "set4")
+        self.assertEqual(len(answers), 16)
+        self.assertEqual(answers["1"], "B")
+        self.assertEqual(answers["8"], "C")
+        self.assertEqual(answers["9"], "A")
+        self.assertEqual(answers["10"], "D")
+        self.assertEqual(answers["16"], "B")
 
     def test_detect_answers_and_set_from_rotated_image(self):
         with TemporaryDirectory() as temp_dir:
@@ -527,6 +668,220 @@ Email ID: *candidate 57@example.com*
             self.assertEqual(job["rows"][0]["roll_no"], "23EE0446")
             self.assertTrue(Path(job["csv_path"]).exists())
             self.assertTrue(job["download_url"].startswith("/api/download/upload_scores_"))
+
+    def test_background_batch_jobs_are_serialized(self):
+        with TemporaryDirectory() as temp_dir:
+            first = Path(temp_dir) / "first.jpg"
+            second = Path(temp_dir) / "second.jpg"
+            first.write_bytes(b"fake first image")
+            second.write_bytes(b"fake second image")
+            result = {
+                "name": "Ada",
+                "email": "ada@example.com",
+                "roll_no": "23EE0446",
+                "set": "set1",
+                "answered_questions": 16,
+                "total_questions": 16,
+                "unanswered_questions": 0,
+                "score": 10,
+                "max_score": 16,
+                "identity_warnings": [],
+            }
+            first_started = threading.Event()
+            release_first = threading.Event()
+            second_started = threading.Event()
+            call_order: list[str] = []
+
+            def score_path_once_at_a_time(path: Path) -> dict:
+                call_order.append(path.name)
+                if path == first:
+                    first_started.set()
+                    self.assertFalse(second_started.is_set())
+                    self.assertTrue(release_first.wait(timeout=5))
+                else:
+                    second_started.set()
+                return result
+
+            first_job_id = create_batch_job(1, "first_batch")
+            second_job_id = create_batch_job(1, "second_batch")
+
+            with patch("app.OUTPUT_DIR", Path(temp_dir)), patch("app.score_path", side_effect=score_path_once_at_a_time):
+                first_thread = threading.Thread(
+                    target=process_saved_upload_batch_job,
+                    args=(first_job_id, [("first.jpg", first)]),
+                )
+                second_thread = threading.Thread(
+                    target=process_saved_upload_batch_job,
+                    args=(second_job_id, [("second.jpg", second)]),
+                )
+                first_thread.start()
+                self.assertTrue(first_started.wait(timeout=5))
+                second_thread.start()
+
+                second_job = None
+                for _ in range(100):
+                    second_job = get_batch_job(second_job_id)
+                    if second_job and second_job["message"]:
+                        break
+                    time.sleep(0.01)
+
+                self.assertIsNotNone(second_job)
+                assert second_job is not None
+                self.assertEqual(second_job["status"], "queued")
+                self.assertEqual(second_job["processed_files"], 0)
+                self.assertEqual(second_job["message"], "Waiting for another OCR batch to finish")
+                self.assertFalse(second_started.is_set())
+
+                release_first.set()
+                first_thread.join(timeout=5)
+                second_thread.join(timeout=5)
+
+            self.assertFalse(first_thread.is_alive())
+            self.assertFalse(second_thread.is_alive())
+            self.assertEqual(call_order, ["first.jpg", "second.jpg"])
+            first_job = get_batch_job(first_job_id)
+            second_job = get_batch_job(second_job_id)
+            self.assertIsNotNone(first_job)
+            self.assertIsNotNone(second_job)
+            assert first_job is not None
+            assert second_job is not None
+            self.assertEqual(first_job["status"], "completed")
+            self.assertEqual(second_job["status"], "completed")
+            self.assertEqual(second_job["processed_files"], 1)
+
+    def test_combined_pdf_background_job_writes_csv(self):
+        with TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "combined.pdf"
+            source.write_bytes(b"fake pdf")
+            pages = [Path(temp_dir) / "page-1.png", Path(temp_dir) / "page-2.png"]
+            for page in pages:
+                page.write_bytes(b"fake page")
+            result = {
+                "name": "Ada",
+                "email": "ada@example.com",
+                "roll_no": "23EE0446",
+                "set": "set1",
+                "answered_questions": 16,
+                "total_questions": 16,
+                "unanswered_questions": 0,
+                "score": 10,
+                "max_score": 16,
+                "identity_warnings": [],
+            }
+            job_id = create_batch_job(2, "combined_batch", job_type="combined_pdf", unit_label="page(s)")
+
+            with (
+                patch("app.OUTPUT_DIR", Path(temp_dir)),
+                patch("app.render_pdf_pages", return_value=pages),
+                patch("app.call_lighton_chat_ocr_image", return_value="ocr text"),
+                patch("app.call_lighton_identity_ocr_image", return_value="identity text"),
+                patch("app.score_ocr_text", return_value=result),
+            ):
+                process_combined_pdf_job(job_id, source, "combined.pdf", 2)
+
+            job = get_batch_job(job_id)
+            self.assertIsNotNone(job)
+            assert job is not None
+            self.assertEqual(job["status"], "completed")
+            self.assertEqual(job["job_type"], "combined_pdf")
+            self.assertEqual(job["unit_label"], "page(s)")
+            self.assertEqual(job["processed_files"], 2)
+            self.assertEqual(job["successful_files"], 2)
+            self.assertEqual(job["failed_files"], 0)
+            self.assertEqual(job["rows"][0]["source"], "combined.pdf page 1")
+            self.assertTrue(Path(job["csv_path"]).exists())
+            self.assertTrue(job["download_url"].startswith("/api/download/combined_pdf_scores_"))
+
+    def test_folder_and_combined_pdf_jobs_share_large_job_queue(self):
+        with TemporaryDirectory() as temp_dir:
+            folder_source = Path(temp_dir) / "folder-sheet.jpg"
+            pdf_source = Path(temp_dir) / "combined.pdf"
+            page = Path(temp_dir) / "page-1.png"
+            folder_source.write_bytes(b"fake image")
+            pdf_source.write_bytes(b"fake pdf")
+            page.write_bytes(b"fake page")
+            result = {
+                "name": "Ada",
+                "email": "ada@example.com",
+                "roll_no": "23EE0446",
+                "set": "set1",
+                "answered_questions": 16,
+                "total_questions": 16,
+                "unanswered_questions": 0,
+                "score": 10,
+                "max_score": 16,
+                "identity_warnings": [],
+            }
+            folder_started = threading.Event()
+            release_folder = threading.Event()
+            pdf_render_started = threading.Event()
+            call_order: list[str] = []
+
+            def score_folder(path: Path) -> dict:
+                call_order.append(path.name)
+                folder_started.set()
+                self.assertFalse(pdf_render_started.is_set())
+                self.assertTrue(release_folder.wait(timeout=5))
+                return result
+
+            def render_pdf(*args, **kwargs) -> list[Path]:
+                call_order.append("render-pdf")
+                pdf_render_started.set()
+                return [page]
+
+            folder_job_id = create_batch_job(1, "folder_batch")
+            pdf_job_id = create_batch_job(1, "combined_batch", job_type="combined_pdf", unit_label="page(s)")
+
+            with (
+                patch("app.OUTPUT_DIR", Path(temp_dir)),
+                patch("app.score_path", side_effect=score_folder),
+                patch("app.render_pdf_pages", side_effect=render_pdf),
+                patch("app.call_lighton_chat_ocr_image", return_value="ocr text"),
+                patch("app.call_lighton_identity_ocr_image", return_value="identity text"),
+                patch("app.score_ocr_text", return_value=result),
+            ):
+                folder_thread = threading.Thread(
+                    target=process_saved_upload_batch_job,
+                    args=(folder_job_id, [("folder-sheet.jpg", folder_source)]),
+                )
+                pdf_thread = threading.Thread(
+                    target=process_combined_pdf_job,
+                    args=(pdf_job_id, pdf_source, "combined.pdf", 1),
+                )
+                folder_thread.start()
+                self.assertTrue(folder_started.wait(timeout=5))
+                pdf_thread.start()
+
+                pdf_job = None
+                for _ in range(100):
+                    pdf_job = get_batch_job(pdf_job_id)
+                    if pdf_job and pdf_job["message"]:
+                        break
+                    time.sleep(0.01)
+
+                self.assertIsNotNone(pdf_job)
+                assert pdf_job is not None
+                self.assertEqual(pdf_job["status"], "queued")
+                self.assertEqual(pdf_job["processed_files"], 0)
+                self.assertEqual(pdf_job["message"], "Waiting for another OCR batch to finish")
+                self.assertFalse(pdf_render_started.is_set())
+
+                release_folder.set()
+                folder_thread.join(timeout=5)
+                pdf_thread.join(timeout=5)
+
+            self.assertFalse(folder_thread.is_alive())
+            self.assertFalse(pdf_thread.is_alive())
+            self.assertEqual(call_order, ["folder-sheet.jpg", "render-pdf"])
+            folder_job = get_batch_job(folder_job_id)
+            pdf_job = get_batch_job(pdf_job_id)
+            self.assertIsNotNone(folder_job)
+            self.assertIsNotNone(pdf_job)
+            assert folder_job is not None
+            assert pdf_job is not None
+            self.assertEqual(folder_job["status"], "completed")
+            self.assertEqual(pdf_job["status"], "completed")
+            self.assertEqual(pdf_job["processed_files"], 1)
 
     def test_save_answer_key_json(self):
         with TemporaryDirectory() as temp_dir:

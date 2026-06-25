@@ -48,6 +48,9 @@ OPTION_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 DEFAULT_SET_OPTIONS = ["1", "2", "3", "4"]
 SUPPORTED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 SUPPORTED_DOCUMENT_SUFFIXES = SUPPORTED_IMAGE_SUFFIXES | {".pdf", ".txt", ".json"}
+ANSWER_GRID_TOP_FRACTION = 0.28
+ANSWER_GRID_BOTTOM_FRACTION = 0.96
+ANSWER_ROW_CLUSTER_FRACTION = 0.032
 
 
 @dataclass(frozen=True)
@@ -112,6 +115,17 @@ def parse_key_value(line: str, key: str) -> str | None:
 def clean_ocr_value(value: str) -> str | None:
     cleaned = re.sub(r"<[^>]+>", " ", value)
     cleaned = html_lib.unescape(cleaned)
+    for _ in range(3):
+        updated = re.sub(
+            r"\\(?:text|mathrm|mathbf|underline)\s*\{\s*([^{}]+?)\s*\}",
+            r"\1",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        if updated == cleaned:
+            break
+        cleaned = updated
+    cleaned = re.sub(r"[$\\{}]+", " ", cleaned)
     cleaned = re.sub(r"[*_`#]+", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" :-–—")
     return cleaned or None
@@ -201,7 +215,7 @@ def normalize_marked_set_selection(value: str | list[str] | None) -> str | list[
 
 def normalize_set_search_line(line: str) -> str:
     normalized = html_lib.unescape(line)
-    normalized = re.sub(r"\\text\s*\{\s*([^{}]+?)\s*\}", r"\1", normalized)
+    normalized = re.sub(r"\\text\s*\{\s*([^{}]+?)\s*\}", r"\1", normalized, flags=re.IGNORECASE)
     normalized = re.sub(r"\\(?:long)?(?:right)?arrow|\\to", " -> ", normalized, flags=re.IGNORECASE)
     normalized = re.sub(r"[$*_`{}]+", " ", normalized)
     normalized = re.sub(r"\s+", " ", normalized)
@@ -1029,7 +1043,7 @@ def layout_orientation_score(image: Image.Image) -> float:
     set_bonus = 8 if _detect_marked_set_from_rgb(rgb) else 0
     portrait_bonus = 2 if height > width else 0
     header_bonus = _layout_upright_header_score(rgb)
-    return float((len(answers) * 10) + answered_count + set_bonus + portrait_bonus + header_bonus)
+    return float((len(answers) * 10) + answered_count + set_bonus + portrait_bonus + (header_bonus * 1.5))
 
 
 def _layout_upright_header_score(rgb: Any) -> float:
@@ -1279,6 +1293,25 @@ def detect_answers_from_image(image_path: str | Path) -> list[dict[str, Any]]:
     return _detect_answers_from_rgb(np.array(image))
 
 
+def _select_answer_grid_rows(rows: list[list[list[int]]], np: Any) -> list[list[list[int]]]:
+    if len(rows) <= 8:
+        return rows[:8]
+
+    def median_y(row: list[list[int]]) -> float:
+        return float(np.median([circle[1] for circle in row]))
+
+    def window_score(window: list[list[list[int]]]) -> float:
+        ys = [median_y(row) for row in window]
+        gaps = [ys[index + 1] - ys[index] for index in range(len(ys) - 1)]
+        median_gap = max(1.0, float(np.median(gaps)))
+        gap_score = sum(abs(gap - median_gap) / median_gap for gap in gaps)
+        extra_circle_penalty = sum(max(0, len(row) - 8) for row in window) * 0.08
+        return gap_score + extra_circle_penalty
+
+    windows = [rows[index : index + 8] for index in range(len(rows) - 7)]
+    return min(windows, key=window_score)
+
+
 def _detect_answers_from_rgb(rgb: Any) -> list[dict[str, Any]]:
     try:
         import cv2
@@ -1305,13 +1338,14 @@ def _detect_answers_from_rgb(rgb: Any) -> list[dict[str, Any]]:
     detected = [
         circle
         for circle in detected
-        if height * 0.30 < circle[1] < height * 0.93 and width * 0.04 < circle[0] < width * 0.86
+        if height * ANSWER_GRID_TOP_FRACTION < circle[1] < height * ANSWER_GRID_BOTTOM_FRACTION
+        and width * 0.04 < circle[0] < width * 0.86
     ]
     detected = sorted(detected, key=lambda circle: (circle[1], circle[0]))
 
     rows: list[list[list[int]]] = []
     for circle in detected:
-        if not rows or abs(float(np.median([item[1] for item in rows[-1]])) - circle[1]) > height * 0.035:
+        if not rows or abs(float(np.median([item[1] for item in rows[-1]])) - circle[1]) > height * ANSWER_ROW_CLUSTER_FRACTION:
             rows.append([circle])
         else:
             rows[-1].append(circle)
@@ -1323,7 +1357,7 @@ def _detect_answers_from_rgb(rgb: Any) -> list[dict[str, Any]]:
             row = [circle for circle in row if abs(circle[1] - median_y) <= height * 0.02]
         if len(row) >= 8:
             cleaned_rows.append(row)
-    rows = cleaned_rows[:8]
+    rows = _select_answer_grid_rows(cleaned_rows, np)
     if len(rows) < 6:
         return []
 

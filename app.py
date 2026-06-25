@@ -57,6 +57,8 @@ MANUAL_SET_NUMBERS = ("1", "2", "3", "4")
 app = FastAPI(title="OMR Evaluation Service")
 BATCH_JOBS: dict[str, dict[str, Any]] = {}
 BATCH_JOBS_LOCK = threading.Lock()
+# Large OCR jobs are intentionally single-worker per app process.
+LARGE_JOB_PROCESSING_LOCK = threading.Lock()
 
 
 def ensure_dirs() -> None:
@@ -148,13 +150,15 @@ def normalize_manual_set(set_number: str) -> str:
     return f"set{selected}"
 
 
-def create_batch_job(total_files: int, batch: str) -> str:
+def create_batch_job(total_files: int, batch: str, job_type: str = "folder", unit_label: str = "file(s)") -> str:
     job_id = uuid.uuid4().hex
     now = time.time()
     with BATCH_JOBS_LOCK:
         BATCH_JOBS[job_id] = {
             "job_id": job_id,
             "batch": batch,
+            "job_type": job_type,
+            "unit_label": unit_label,
             "status": "queued",
             "total_files": total_files,
             "processed_files": 0,
@@ -164,6 +168,9 @@ def create_batch_job(total_files: int, batch: str) -> str:
             "csv_path": "",
             "download_url": "",
             "error": "",
+            "message": "",
+            "estimated_processing_seconds": "",
+            "estimated_processing_time": "",
             "rows": [],
             "created_at": now,
             "updated_at": now,
@@ -186,6 +193,17 @@ def get_batch_job(job_id: str) -> dict[str, Any] | None:
         if job is None:
             return None
         return dict(job)
+
+
+def acquire_large_job_slot(job_id: str) -> None:
+    acquired_slot = LARGE_JOB_PROCESSING_LOCK.acquire(blocking=False)
+    if not acquired_slot:
+        update_batch_job(job_id, status="queued", message="Waiting for another OCR batch to finish")
+        LARGE_JOB_PROCESSING_LOCK.acquire()
+
+
+def release_large_job_slot() -> None:
+    LARGE_JOB_PROCESSING_LOCK.release()
 
 
 def validate_combined_pdf(path: Path) -> int:
@@ -575,14 +593,21 @@ def index() -> str:
       result.textContent = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
     }}
     function renderBatchJob(job) {{
+      const unitLabel = job.unit_label || 'file(s)';
       const lines = [
         `Status: ${{job.status}}`,
-        `Processed: ${{job.processed_files}} / ${{job.total_files}} file(s)`,
+        `Processed: ${{job.processed_files}} / ${{job.total_files}} ${{unitLabel}}`,
         `Successful: ${{job.successful_files}}`,
         `Failed: ${{job.failed_files}}`
       ];
       if (job.current_file) {{
         lines.push(`Current: ${{job.current_file}}`);
+      }}
+      if (job.message) {{
+        lines.push(`Message: ${{job.message}}`);
+      }}
+      if (job.estimated_processing_time) {{
+        lines.push(`Approx time: ${{job.estimated_processing_time}} (${{job.estimated_processing_seconds}} sec)`);
       }}
       if (job.error) {{
         lines.push('', `Error: ${{job.error}}`);
@@ -693,7 +718,7 @@ def index() -> str:
         }}
       }});
       xhr.upload.addEventListener('load', () => {{
-        result.textContent = 'Upload complete. Rendering pages and processing OMR sheets...';
+        result.textContent = 'Upload complete. Queueing combined PDF for processing...';
       }});
       xhr.onload = () => {{
         let payload;
@@ -704,17 +729,12 @@ def index() -> str:
           return;
         }}
         result.classList.remove('error');
-        const summary = [
-          `Done. Processed ${{payload.processed_pages}} / ${{payload.total_pages}} page(s).`,
-          `Approx time: ${{payload.estimated_processing_time}} (${{payload.estimated_processing_seconds}} sec)`,
-          `Successful: ${{payload.successful_pages}}`,
-          `Failed: ${{payload.failed_pages}}`,
-          '',
-          `CSV: ${{window.location.origin + payload.download_url}}`,
-          '',
-          JSON.stringify(payload.rows, null, 2)
-        ].join('\\n');
-        result.textContent = summary;
+        if (payload.job_id) {{
+          renderBatchJob(payload);
+          pollBatchJob(payload.job_id);
+          return;
+        }}
+        result.textContent = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
       }};
       xhr.onerror = () => {{
         result.classList.add('error');
@@ -828,87 +848,147 @@ def process_saved_upload_batch_job(job_id: str, saved_files: list[tuple[str, Pat
     rows: list[dict[str, Any]] = []
     successful_files = 0
     failed_files = 0
-    update_batch_job(job_id, status="running")
+    acquire_large_job_slot(job_id)
+
     try:
-        for index, (original_name, saved) in enumerate(saved_files, start=1):
+        update_batch_job(job_id, status="running", message="Processing folder batch")
+        try:
+            for index, (original_name, saved) in enumerate(saved_files, start=1):
+                update_batch_job(
+                    job_id,
+                    current_file=original_name,
+                    processed_files=index - 1,
+                    successful_files=successful_files,
+                    failed_files=failed_files,
+                    rows=list(rows),
+                )
+                try:
+                    result = score_path(saved)
+                    row = row_from_result(original_name, result)
+                    successful_files += 1
+                except Exception as error:
+                    row = row_from_result(original_name, {}, str(error))
+                    failed_files += 1
+                rows.append(row)
+                update_batch_job(
+                    job_id,
+                    processed_files=index,
+                    successful_files=successful_files,
+                    failed_files=failed_files,
+                    rows=list(rows),
+                )
+
+            output_path = write_score_csv(rows, prefix="upload_scores")
             update_batch_job(
                 job_id,
-                current_file=original_name,
-                processed_files=index - 1,
-                successful_files=successful_files,
-                failed_files=failed_files,
-                rows=list(rows),
+                status="completed",
+                current_file="",
+                message="",
+                csv_path=str(output_path),
+                download_url=f"/api/download/{output_path.name}",
+                rows=rows,
             )
-            try:
-                result = score_path(saved)
-                row = row_from_result(original_name, result)
-                successful_files += 1
-            except Exception as error:
-                row = row_from_result(original_name, {}, str(error))
-                failed_files += 1
-            rows.append(row)
+        except Exception as error:
+            output_path = write_score_csv(rows, prefix="upload_scores_partial") if rows else None
             update_batch_job(
                 job_id,
-                processed_files=index,
-                successful_files=successful_files,
-                failed_files=failed_files,
-                rows=list(rows),
+                status="failed",
+                current_file="",
+                message="",
+                error=str(error),
+                csv_path=str(output_path) if output_path else "",
+                download_url=f"/api/download/{output_path.name}" if output_path else "",
+                rows=rows,
             )
-
-        output_path = write_score_csv(rows, prefix="upload_scores")
-        update_batch_job(
-            job_id,
-            status="completed",
-            current_file="",
-            csv_path=str(output_path),
-            download_url=f"/api/download/{output_path.name}",
-            rows=rows,
-        )
-    except Exception as error:
-        output_path = write_score_csv(rows, prefix="upload_scores_partial") if rows else None
-        update_batch_job(
-            job_id,
-            status="failed",
-            current_file="",
-            error=str(error),
-            csv_path=str(output_path) if output_path else "",
-            download_url=f"/api/download/{output_path.name}" if output_path else "",
-            rows=rows,
-        )
+    finally:
+        release_large_job_slot()
 
 
-def process_combined_pdf(path: Path, original_name: str) -> tuple[Path, list[dict[str, Any]], int]:
-    page_count = validate_combined_pdf(path)
+def process_combined_pdf_job(job_id: str, path: Path, original_name: str, page_count: int) -> None:
     rows: list[dict[str, Any]] = []
+    successful_pages = 0
+    failed_pages = 0
+    acquire_large_job_slot(job_id)
 
-    with tempfile.TemporaryDirectory(prefix="omr_combined_pdf_") as temp_dir:
-        pages = render_pdf_pages(path, temp_dir, dpi=PDF_DPI)
-        if len(pages) != page_count:
-            page_count = len(pages)
-        for index, page in enumerate(pages, start=1):
-            source = f"{original_name} page {index}"
-            try:
-                ocr_text = call_lighton_chat_ocr_image(
-                    page,
-                    OCR_BASE_URL,
-                    OCR_MODEL,
-                    api_key=OCR_API_KEY,
-                    timeout_seconds=OCR_TIMEOUT,
-                )
-                identity_ocr_text = call_lighton_identity_ocr_image(
-                    page,
-                    OCR_BASE_URL,
-                    OCR_MODEL,
-                    api_key=OCR_API_KEY,
-                    timeout_seconds=OCR_TIMEOUT,
-                )
-                result = score_ocr_text(ocr_text, identity_ocr_text=identity_ocr_text, image_path=page)
-                rows.append(row_from_result(source, result))
-            except Exception as error:
-                rows.append(row_from_result(source, {}, str(error)))
+    try:
+        update_batch_job(job_id, status="running", message="Rendering combined PDF pages")
+        try:
+            with tempfile.TemporaryDirectory(prefix="omr_combined_pdf_") as temp_dir:
+                pages = render_pdf_pages(path, temp_dir, dpi=PDF_DPI)
+                if len(pages) != page_count:
+                    page_count = len(pages)
+                    update_batch_job(
+                        job_id,
+                        total_files=page_count,
+                        estimated_processing_seconds=estimated_combined_pdf_seconds(page_count),
+                        estimated_processing_time=format_duration(estimated_combined_pdf_seconds(page_count)),
+                    )
+                for index, page in enumerate(pages, start=1):
+                    source = f"{original_name} page {index}"
+                    update_batch_job(
+                        job_id,
+                        status="running",
+                        message="Processing combined PDF pages",
+                        current_file=source,
+                        processed_files=index - 1,
+                        successful_files=successful_pages,
+                        failed_files=failed_pages,
+                        rows=list(rows),
+                    )
+                    try:
+                        ocr_text = call_lighton_chat_ocr_image(
+                            page,
+                            OCR_BASE_URL,
+                            OCR_MODEL,
+                            api_key=OCR_API_KEY,
+                            timeout_seconds=OCR_TIMEOUT,
+                        )
+                        identity_ocr_text = call_lighton_identity_ocr_image(
+                            page,
+                            OCR_BASE_URL,
+                            OCR_MODEL,
+                            api_key=OCR_API_KEY,
+                            timeout_seconds=OCR_TIMEOUT,
+                        )
+                        result = score_ocr_text(ocr_text, identity_ocr_text=identity_ocr_text, image_path=page)
+                        row = row_from_result(source, result)
+                        successful_pages += 1
+                    except Exception as error:
+                        row = row_from_result(source, {}, str(error))
+                        failed_pages += 1
+                    rows.append(row)
+                    update_batch_job(
+                        job_id,
+                        processed_files=index,
+                        successful_files=successful_pages,
+                        failed_files=failed_pages,
+                        rows=list(rows),
+                    )
 
-    output_path = write_score_csv(rows, prefix="combined_pdf_scores")
-    return output_path, rows, page_count
+            output_path = write_score_csv(rows, prefix="combined_pdf_scores")
+            update_batch_job(
+                job_id,
+                status="completed",
+                current_file="",
+                message="",
+                csv_path=str(output_path),
+                download_url=f"/api/download/{output_path.name}",
+                rows=rows,
+            )
+        except Exception as error:
+            output_path = write_score_csv(rows, prefix="combined_pdf_scores_partial") if rows else None
+            update_batch_job(
+                job_id,
+                status="failed",
+                current_file="",
+                message="",
+                error=str(error),
+                csv_path=str(output_path) if output_path else "",
+                download_url=f"/api/download/{output_path.name}" if output_path else "",
+                rows=rows,
+            )
+    finally:
+        release_large_job_slot()
 
 
 @app.post("/api/score-upload-batch-json")
@@ -935,29 +1015,29 @@ def batch_job_status(job_id: str) -> JSONResponse:
 
 
 @app.post("/api/score-combined-pdf")
-async def score_combined_pdf(file: UploadFile = File(...)) -> JSONResponse:
+async def score_combined_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)) -> JSONResponse:
     saved = await save_upload(file, "combined_pdfs")
     try:
-        output_path, rows, page_count = process_combined_pdf(saved, file.filename or saved.name)
+        page_count = validate_combined_pdf(saved)
     except Exception as error:
         saved.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=str(error)) from error
 
-    failed_pages = sum(1 for row in rows if row.get("error"))
     estimated_seconds = estimated_combined_pdf_seconds(page_count)
-    return JSONResponse(
-        {
-            "total_pages": page_count,
-            "processed_pages": len(rows),
-            "estimated_processing_seconds": estimated_seconds,
-            "estimated_processing_time": format_duration(estimated_seconds),
-            "successful_pages": len(rows) - failed_pages,
-            "failed_pages": failed_pages,
-            "csv_path": str(output_path),
-            "download_url": f"/api/download/{output_path.name}",
-            "rows": rows,
-        }
+    job_id = create_batch_job(
+        page_count,
+        f"combined_pdf_{int(time.time())}_{uuid.uuid4().hex[:8]}",
+        job_type="combined_pdf",
+        unit_label="page(s)",
     )
+    update_batch_job(
+        job_id,
+        estimated_processing_seconds=estimated_seconds,
+        estimated_processing_time=format_duration(estimated_seconds),
+    )
+    background_tasks.add_task(process_combined_pdf_job, job_id, saved, file.filename or saved.name, page_count)
+    job = get_batch_job(job_id)
+    return JSONResponse(job)
 
 
 @app.get("/api/download/{filename}")
