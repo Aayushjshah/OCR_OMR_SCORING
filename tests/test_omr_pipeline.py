@@ -471,6 +471,87 @@ Roll No.: $\\TEXT{RA231104701014}$
         self.assertEqual(answers["10"], "D")
         self.assertEqual(answers["16"], "B")
 
+    def test_phone_photo_perspective_registration_when_available(self):
+        paths = [
+            Path("/Users/aayush.shah/Downloads/IMG_8188.JPG.jpeg"),
+            Path("/Users/aayush.shah/Downloads/Hadn written/IMG_8188.JPG.jpeg"),
+        ]
+        path = next((candidate for candidate in paths if candidate.exists()), None)
+        if path is None:
+            self.skipTest("local phone photo fixture is not available")
+
+        answers = {answer["question_id"]: answer["selected"] for answer in detect_answers_from_image(path)}
+
+        self.assertEqual(detect_marked_set_from_image(path), "set1")
+        self.assertEqual(
+            answers,
+            {
+                "1": "D",
+                "2": "B",
+                "3": "B",
+                "4": "B",
+                "5": "D",
+                "6": "C",
+                "7": "D",
+                "8": "A",
+                "9": "A",
+                "10": "A",
+                "11": "C",
+                "12": "D",
+                "13": "B",
+                "14": "D",
+                "15": "A",
+                "16": "A",
+            },
+        )
+
+    def test_phone_photo_skewed_bottom_rows_when_available(self):
+        path = Path("/Users/aayush.shah/Downloads/Hadn written/IMG_8190.JPG.jpeg")
+        if not path.exists():
+            self.skipTest("local skewed phone photo fixture is not available")
+
+        answers = {answer["question_id"]: answer["selected"] for answer in detect_answers_from_image(path)}
+
+        self.assertEqual(detect_marked_set_from_image(path), "set4")
+        self.assertEqual(
+            answers,
+            {
+                "1": "D",
+                "2": "C",
+                "3": "A",
+                "4": "C",
+                "5": "A",
+                "6": "B",
+                "7": "D",
+                "8": "C",
+                "9": "D",
+                "10": "C",
+                "11": "B",
+                "12": "D",
+                "13": "A",
+                "14": "A",
+                "15": "D",
+                "16": "A",
+            },
+        )
+
+    def test_phone_photo_set_markers_when_available(self):
+        cases = {
+            "IMG_8192.JPG.jpeg": "set2",
+            "IMG_8195.JPG.jpeg": "set3",
+            "IMG_8197.JPG.jpeg": "set1",
+            "IMG_8199.JPG.jpeg": "set2",
+        }
+        folder = Path("/Users/aayush.shah/Downloads/Hadn written")
+        paths = {name: folder / name for name in cases}
+        if not any(path.exists() for path in paths.values()):
+            self.skipTest("local phone photo set marker fixtures are not available")
+
+        for name, expected_set in cases.items():
+            path = paths[name]
+            if path.exists():
+                self.assertEqual(detect_marked_set_from_image(path), expected_set)
+
     def test_detect_answers_and_set_from_rotated_image(self):
         with TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "rotated_answers.png"

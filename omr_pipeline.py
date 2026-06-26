@@ -1017,7 +1017,138 @@ def find_chat_message_content(payload: Any) -> str | None:
 
 def load_omr_layout_image(image_path: str | Path) -> Image.Image:
     image = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
+    image = normalize_omr_page_perspective(image)
     return normalize_omr_layout_orientation(image)
+
+
+def normalize_omr_page_perspective(image: Image.Image) -> Image.Image:
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return image
+
+    rgb = np.array(image)
+    quad = _detect_page_marker_quad(rgb)
+    if quad is None:
+        return image
+
+    tl, tr, br, bl = quad
+    quad_area = float(cv2.contourArea(quad))
+    coverage = quad_area / float(rgb.shape[0] * rgb.shape[1])
+    top_width = float(np.linalg.norm(tr - tl))
+    bottom_width = float(np.linalg.norm(br - bl))
+    left_height = float(np.linalg.norm(bl - tl))
+    right_height = float(np.linalg.norm(br - tr))
+    width_delta = abs(top_width - bottom_width) / max(1.0, top_width, bottom_width)
+    height_delta = abs(left_height - right_height) / max(1.0, left_height, right_height)
+    if coverage > 0.70 or width_delta > 0.35 or height_delta > 0.22:
+        return image
+
+    min_x, min_y = quad.min(axis=0)
+    max_x, max_y = quad.max(axis=0)
+    if min_y > rgb.shape[0] * 0.25 or max_y < rgb.shape[0] * 0.72:
+        return image
+    if min_x > rgb.shape[1] * 0.28 or max_x < rgb.shape[1] * 0.75:
+        return image
+
+    width = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
+    height = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
+    if width < 400 or height < 600:
+        return image
+
+    destination = np.array(
+        [[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]],
+        dtype=np.float32,
+    )
+    transform = cv2.getPerspectiveTransform(quad.astype(np.float32), destination)
+    warped = cv2.warpPerspective(rgb, transform, (width, height), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    return Image.fromarray(warped)
+
+
+def _detect_page_marker_quad(rgb: Any) -> Any | None:
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return None
+
+    height, width = rgb.shape[:2]
+    image_area = height * width
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    _, mask = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), dtype=np.uint8))
+    component_count, _, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
+
+    candidates: list[dict[str, Any]] = []
+    for component_index in range(1, component_count):
+        x, y, component_width, component_height, area = stats[component_index]
+        if area < max(400, image_area * 0.00008) or area > image_area * 0.02:
+            continue
+        aspect_ratio = component_width / float(component_height)
+        if not (0.45 <= aspect_ratio <= 2.20):
+            continue
+        fill_ratio = area / float(component_width * component_height)
+        if fill_ratio < 0.35:
+            continue
+        center_x, center_y = centroids[component_index]
+        candidates.append(
+            {
+                "center": (float(center_x), float(center_y)),
+                "area": float(area),
+                "box": (int(x), int(y), int(component_width), int(component_height)),
+            }
+        )
+
+    if len(candidates) < 4:
+        return None
+
+    candidates = sorted(candidates, key=lambda item: float(item["area"]), reverse=True)[:40]
+
+    def order_points(points: list[tuple[float, float]]) -> Any:
+        pts = np.array(points, dtype=np.float32)
+        sums = pts.sum(axis=1)
+        diffs = np.diff(pts, axis=1)[:, 0]
+        return np.array(
+            [pts[np.argmin(sums)], pts[np.argmin(diffs)], pts[np.argmax(sums)], pts[np.argmax(diffs)]],
+            dtype=np.float32,
+        )
+
+    def score_quad(combo: tuple[dict[str, Any], ...]) -> tuple[float, Any]:
+        quad = order_points([candidate["center"] for candidate in combo])
+        area = float(cv2.contourArea(quad))
+        if area < image_area * 0.25:
+            return -float("inf"), quad
+
+        tl, tr, br, bl = quad
+        page_width = max(float(np.linalg.norm(br - bl)), float(np.linalg.norm(tr - tl)))
+        page_height = max(float(np.linalg.norm(tr - br)), float(np.linalg.norm(tl - bl)))
+        if page_width <= 0 or page_height <= 0:
+            return -float("inf"), quad
+
+        aspect_ratio = page_height / page_width
+        if not (1.15 <= aspect_ratio <= 1.85):
+            return -float("inf"), quad
+
+        corner_distance = (
+            float(np.linalg.norm(tl - np.array([0, 0])))
+            + float(np.linalg.norm(tr - np.array([width, 0])))
+            + float(np.linalg.norm(br - np.array([width, height])))
+            + float(np.linalg.norm(bl - np.array([0, height])))
+        )
+        marker_area = sum(float(candidate["area"]) for candidate in combo)
+        aspect_penalty = abs(aspect_ratio - 1.42) * image_area * 0.05
+        return area + (marker_area * 20.0) - (corner_distance * 300.0) - aspect_penalty, quad
+
+    best_score = -float("inf")
+    best_quad = None
+    for combo in itertools.combinations(candidates, 4):
+        score, quad = score_quad(combo)
+        if score > best_score:
+            best_score = score
+            best_quad = quad
+
+    return best_quad
 
 
 def normalize_omr_layout_orientation(image: Image.Image) -> Image.Image:
@@ -1025,7 +1156,7 @@ def normalize_omr_layout_orientation(image: Image.Image) -> Image.Image:
     scored_variants = [(layout_orientation_score(variant), angle, variant) for angle, variant in variants]
     best_score, _, best_image = max(scored_variants, key=lambda item: (item[0], -item[1]))
     original_score = scored_variants[0][0]
-    if best_score <= 0 or best_score == original_score:
+    if best_score <= 0 or best_score < original_score + 8.0:
         return image
     return best_image
 
@@ -1040,7 +1171,7 @@ def layout_orientation_score(image: Image.Image) -> float:
     rgb = np.array(image)
     answers = _detect_answers_from_rgb(rgb)
     answered_count = sum(1 for answer in answers if answer.get("selected") is not None)
-    set_bonus = 8 if _detect_marked_set_from_rgb(rgb) else 0
+    set_bonus = 8 if _detect_marked_set_from_rgb(rgb, allow_filled_position=False) else 0
     portrait_bonus = 2 if height > width else 0
     header_bonus = _layout_upright_header_score(rgb)
     return float((len(answers) * 10) + answered_count + set_bonus + portrait_bonus + (header_bonus * 1.5))
@@ -1058,16 +1189,24 @@ def _layout_upright_header_score(rgb: Any) -> float:
         region = marked[int(height * y0) : int(height * y1), int(width * x0) : int(width * x1)]
         return float(region.mean()) if region.size else 0.0
 
-    title_density = fraction(0.20, 0.05, 0.80, 0.13)
-    identity_density = fraction(0.08, 0.12, 0.92, 0.26)
-    set_density = fraction(0.65, 0.12, 0.90, 0.18)
-    footer_density = fraction(0.08, 0.88, 0.92, 0.97)
+    top_title_density = fraction(0.20, 0.03, 0.82, 0.10)
+    top_identity_density = fraction(0.06, 0.10, 0.96, 0.22)
+    top_set_density = fraction(0.62, 0.09, 0.94, 0.18)
+    top_instruction_density = fraction(0.04, 0.22, 0.78, 0.34)
+    bottom_title_density = fraction(0.18, 0.90, 0.82, 0.98)
+    bottom_identity_density = fraction(0.04, 0.78, 0.96, 0.91)
+    bottom_set_density = fraction(0.04, 0.80, 0.40, 0.91)
+    bottom_footer_density = fraction(0.08, 0.86, 0.92, 0.98)
 
     return (
-        (title_density * 220.0)
-        + (identity_density * 75.0)
-        + (set_density * 120.0)
-        - (footer_density * 180.0)
+        (top_title_density * 420.0)
+        + (top_identity_density * 90.0)
+        + (top_set_density * 70.0)
+        + (top_instruction_density * 35.0)
+        - (bottom_title_density * 520.0)
+        - (bottom_identity_density * 55.0)
+        - (bottom_set_density * 45.0)
+        - (bottom_footer_density * 25.0)
     )
 
 
@@ -1152,16 +1291,23 @@ def crop_identity_header_for_ocr(image_path: str | Path, output_path: str | Path
 
 
 def detect_marked_set_from_image(image_path: str | Path) -> str | None:
-    image = load_omr_layout_image(image_path)
+    image = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
+    allow_filled_position = image.width >= 2000 and image.height >= 2800
+    image = normalize_omr_layout_orientation(image)
     try:
         import numpy as np
     except ImportError:
         return None
 
-    return _detect_marked_set_from_rgb(np.array(image))
+    detected_set = _detect_marked_set_from_rgb(np.array(image), allow_filled_position=allow_filled_position)
+    if detected_set:
+        return detected_set
+
+    image = load_omr_layout_image(image_path)
+    return _detect_marked_set_from_rgb(np.array(image), allow_filled_position=False)
 
 
-def _detect_marked_set_from_rgb(rgb: Any) -> str | None:
+def _detect_marked_set_from_rgb(rgb: Any, *, allow_filled_position: bool = True) -> str | None:
     try:
         import cv2
         import numpy as np
@@ -1219,6 +1365,7 @@ def _detect_marked_set_from_rgb(rgb: Any) -> str | None:
     component_count, _, stats, centroids = cv2.connectedComponentsWithStats(component_mask, 8)
     min_area = math.pi * (min_radius * 0.45) ** 2
     max_area = math.pi * (max_radius * 1.15) ** 2
+    filled_components: list[dict[str, float]] = []
     for component_index in range(1, component_count):
         x, y, component_width, component_height, area = stats[component_index]
         center_x, center_y = centroids[component_index]
@@ -1231,22 +1378,135 @@ def _detect_marked_set_from_rgb(rgb: Any) -> str | None:
         aspect_ratio = component_width / float(component_height)
         if not (0.55 <= aspect_ratio <= 1.85):
             continue
+        filled_components.append(
+            {
+                "x": float(center_x),
+                "y": float(center_y),
+                "radius": float(max(component_width, component_height) / 2),
+                "area": float(area),
+                "aspect_ratio": float(aspect_ratio),
+            }
+        )
         add_candidate(float(center_x), float(center_y), float(max(component_width, component_height) / 2), "filled")
 
     if len(candidates) < len(DEFAULT_SET_OPTIONS):
         return None
 
+    def fill_score(candidate: dict[str, float | str]) -> float:
+        x = int(round(float(candidate["x"])))
+        y = int(round(float(candidate["y"])))
+        radius = float(candidate["radius"])
+        mask = np.zeros(gray.shape, dtype=np.uint8)
+        cv2.circle(mask, (x, y), max(3, int(radius * 0.60)), 255, -1)
+        pixels = marked[mask > 0]
+        return float(pixels.mean()) if pixels.size else 0.0
+
     def fill_scores(group: tuple[dict[str, float | str], ...]) -> list[float]:
         scores: list[float] = []
         for candidate in sorted(group, key=lambda item: float(item["x"])):
-            x = int(round(float(candidate["x"])))
-            y = int(round(float(candidate["y"])))
-            radius = float(candidate["radius"])
-            mask = np.zeros(gray.shape, dtype=np.uint8)
-            cv2.circle(mask, (x, y), max(3, int(radius * 0.60)), 255, -1)
-            pixels = marked[mask > 0]
-            scores.append(float(pixels.mean()) if pixels.size else 0.0)
+            scores.append(fill_score(candidate))
         return scores
+
+    def detect_from_filled_position() -> str | None:
+        plausible_components: list[tuple[float, dict[str, float]]] = []
+        for component in filled_components:
+            x_ratio = component["x"] / float(crop.shape[1])
+            y_ratio = component["y"] / float(crop.shape[0])
+            if not (0.10 <= x_ratio <= 0.84 and 0.40 <= y_ratio <= 0.84):
+                continue
+            if not (0.72 <= component["aspect_ratio"] <= 1.45):
+                continue
+            set_score = component["area"] - (abs(y_ratio - 0.62) * 900.0)
+            plausible_components.append((set_score, component))
+
+        if not plausible_components:
+            return None
+
+        _, component = max(plausible_components, key=lambda item: item[0])
+        x_ratio = component["x"] / float(crop.shape[1])
+        if x_ratio < 0.36:
+            selected_index = 0
+        elif x_ratio < 0.43:
+            selected_index = 1
+        elif x_ratio < 0.525:
+            selected_index = 2
+        else:
+            selected_index = 3
+        return normalize_ocr_set_name(DEFAULT_SET_OPTIONS[selected_index])
+
+    if allow_filled_position:
+        positioned_set = detect_from_filled_position()
+        if positioned_set:
+            return positioned_set
+
+    def detect_from_filled_anchor() -> str | None:
+        expected_gap = width * 0.042
+        anchor_candidates: list[tuple[float, dict[str, float | str]]] = []
+        for candidate in candidates:
+            source = str(candidate["source"])
+            if "filled" not in source:
+                continue
+            x = float(candidate["x"])
+            y = float(candidate["y"])
+            if not (crop.shape[1] * 0.20 < x < crop.shape[1] * 0.84):
+                continue
+            if not (crop.shape[0] * 0.42 < y < crop.shape[0] * 0.84):
+                continue
+            score = fill_score(candidate)
+            if score > 0.25:
+                anchor_candidates.append((score, candidate))
+
+        best_index: int | None = None
+        best_score = -float("inf")
+        for anchor_score, anchor in anchor_candidates:
+            anchor_x = float(anchor["x"])
+            anchor_y = float(anchor["y"])
+            row_candidates = [
+                candidate
+                for candidate in candidates
+                if crop.shape[1] * 0.12 < float(candidate["x"]) < crop.shape[1] * 0.92
+                and abs(float(candidate["y"]) - anchor_y) <= crop.shape[0] * 0.18
+            ]
+            for group in itertools.combinations(row_candidates, len(DEFAULT_SET_OPTIONS)):
+                ordered = tuple(sorted(group, key=lambda item: float(item["x"])))
+                xs = [float(candidate["x"]) for candidate in ordered]
+                ys = [float(candidate["y"]) for candidate in ordered]
+                gaps = [xs[position + 1] - xs[position] for position in range(len(xs) - 1)]
+                mean_gap = float(np.mean(gaps))
+                if not (crop.shape[1] * 0.24 <= xs[0] <= crop.shape[1] * 0.38):
+                    continue
+                if not (width * 0.025 <= mean_gap <= width * 0.058):
+                    continue
+                if min(gaps) < mean_gap * 0.50 or max(gaps) > mean_gap * 1.55:
+                    continue
+                closest_index = min(range(len(xs)), key=lambda index: abs(xs[index] - anchor_x))
+                alignment = abs(xs[closest_index] - anchor_x)
+                if alignment > max(18.0, mean_gap * 0.45):
+                    continue
+                scores = fill_scores(ordered)
+                if scores[closest_index] < 0.25 or sum(score > 0.25 for score in scores) != 1:
+                    continue
+                y_spread = float(np.std(ys))
+                gap_spread = float(np.std(gaps))
+                score = (
+                    (anchor_score * 120.0)
+                    - (abs(mean_gap - expected_gap) * 0.45)
+                    - (gap_spread * 1.2)
+                    - y_spread
+                    - (alignment * 0.25)
+                )
+                if score > best_score:
+                    best_score = score
+                    best_index = closest_index
+
+        if best_index is None:
+            return None
+        return normalize_ocr_set_name(DEFAULT_SET_OPTIONS[best_index])
+
+    if allow_filled_position:
+        anchored_set = detect_from_filled_anchor()
+        if anchored_set:
+            return anchored_set
 
     best_group: tuple[dict[str, float | str], ...] | None = None
     best_group_score = -float("inf")
@@ -1312,12 +1572,172 @@ def _select_answer_grid_rows(rows: list[list[list[int]]], np: Any) -> list[list[
     return min(windows, key=window_score)
 
 
+def _answer_from_scores(question_id: str, option_scores: list[float]) -> dict[str, Any]:
+    selected_options = [
+        OPTION_LETTERS[index]
+        for index, score in enumerate(option_scores)
+        if score > 0.25
+    ]
+    if not selected_options:
+        selected: str | list[str] | None = None
+        status = "unmarked"
+    elif len(selected_options) == 1:
+        selected = selected_options[0]
+        status = "answered"
+    else:
+        selected = selected_options
+        status = "multiple"
+
+    return {
+        "question_id": question_id,
+        "options": list(OPTION_LETTERS[:4]),
+        "selected": selected,
+        "status": status,
+        "source": "image",
+    }
+
+
+def _detect_answers_from_registered_grid(rgb: Any) -> list[dict[str, Any]]:
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return []
+
+    height, width = rgb.shape[:2]
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    circles = cv2.HoughCircles(
+        gray,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=max(25, int(width * 0.04)),
+        param1=80,
+        param2=24,
+        minRadius=max(8, int(width * 0.008)),
+        maxRadius=max(20, int(width * 0.025)),
+    )
+    if circles is None:
+        return []
+
+    detected = np.round(circles[0]).astype(int).tolist()
+    detected = [
+        circle
+        for circle in detected
+        if height * 0.25 < circle[1] < height * ANSWER_GRID_BOTTOM_FRACTION
+        and width * 0.03 < circle[0] < width * 0.90
+    ]
+    detected = sorted(detected, key=lambda circle: (circle[1], circle[0]))
+
+    raw_rows: list[list[list[int]]] = []
+    for circle in detected:
+        if not raw_rows or abs(float(np.median([item[1] for item in raw_rows[-1]])) - circle[1]) > height * ANSWER_ROW_CLUSTER_FRACTION:
+            raw_rows.append([circle])
+        else:
+            raw_rows[-1].append(circle)
+
+    candidate_rows: list[list[list[int]]] = []
+    for row in raw_rows:
+        if len(row) > 8:
+            median_y = float(np.median([circle[1] for circle in row]))
+            row = [circle for circle in row if abs(circle[1] - median_y) <= height * 0.02]
+        if len(row) >= 4:
+            candidate_rows.append(row)
+
+    if len(candidate_rows) < 8:
+        return []
+
+    def median_y(row: list[list[int]]) -> float:
+        return float(np.median([circle[1] for circle in row]))
+
+    def row_window_score(window: list[list[list[int]]]) -> float:
+        ys = [median_y(row) for row in window]
+        gaps = [ys[index + 1] - ys[index] for index in range(len(ys) - 1)]
+        median_gap = max(1.0, float(np.median(gaps)))
+        gap_score = sum(abs(gap - median_gap) / median_gap for gap in gaps)
+        missing_circle_penalty = sum(max(0, 8 - len(row)) for row in window) * 0.10
+        extra_circle_penalty = sum(max(0, len(row) - 9) for row in window) * 0.05
+        return gap_score + missing_circle_penalty + extra_circle_penalty
+
+    windows = [candidate_rows[index : index + 8] for index in range(len(candidate_rows) - 7)]
+    selected_rows = min(windows, key=row_window_score)
+    observed_row_ys = [median_y(row) for row in selected_rows]
+    gaps = [observed_row_ys[index + 1] - observed_row_ys[index] for index in range(len(observed_row_ys) - 1)]
+    median_gap = max(1.0, float(np.median(gaps)))
+    if any(gap < median_gap * 0.50 or gap > median_gap * 1.65 for gap in gaps):
+        return []
+
+    column_observations: list[list[tuple[float, float, float]]] = [[] for _ in range(8)]
+    radii: list[int] = []
+    for row_index, row in enumerate(selected_rows):
+        if not (8 <= len(row) <= 9):
+            continue
+        row = sorted(row, key=lambda circle: circle[0])
+        xs = [circle[0] for circle in row]
+        valid_splits = [
+            (xs[index + 1] - xs[index], index + 1)
+            for index in range(len(xs) - 1)
+            if index + 1 >= 4 and len(xs) - (index + 1) >= 4
+        ]
+        if not valid_splits:
+            continue
+        split_index = max(valid_splits, key=lambda item: item[0])[1]
+        left = sorted(row[:split_index], key=lambda circle: circle[0])[-4:]
+        right = sorted(row[split_index:], key=lambda circle: circle[0])[-4:]
+        if len(left) != 4 or len(right) != 4:
+            continue
+        for index, circle in enumerate(left + right):
+            column_observations[index].append((float(row_index), float(circle[0]), float(circle[1])))
+            radii.append(int(circle[2]))
+
+    if any(len(observations) < 3 for observations in column_observations):
+        return []
+
+    column_models: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    for observations in column_observations:
+        indexes = np.array([item[0] for item in observations])
+        xs = np.array([item[1] for item in observations])
+        ys = np.array([item[2] for item in observations])
+        x_slope, x_intercept = np.polyfit(indexes, xs, 1)
+        y_slope, y_intercept = np.polyfit(indexes, ys, 1)
+        column_models.append(((float(x_slope), float(x_intercept)), (float(y_slope), float(y_intercept))))
+
+    marked = _marked_pixel_mask(rgb)
+    if marked is None:
+        return []
+
+    sample_radius = max(3, int(float(np.median(radii)) * 0.52)) if radii else max(3, int(width * 0.008))
+    answers_by_id: dict[str, dict[str, Any]] = {}
+    for row_index in range(8):
+        for question_id, start_column in ((str(row_index + 1), 0), (str(row_index + 9), 4)):
+            option_scores: list[float] = []
+            for option_index in range(4):
+                x_model, y_model = column_models[start_column + option_index]
+                x = int(round((x_model[0] * row_index) + x_model[1]))
+                center_y = int(round((y_model[0] * row_index) + y_model[1]))
+                mask = np.zeros(gray.shape, dtype=np.uint8)
+                cv2.circle(mask, (x, center_y), sample_radius, 255, -1)
+                pixels = marked[mask > 0]
+                option_scores.append(float(pixels.mean()) if pixels.size else 0.0)
+            answers_by_id[question_id] = _answer_from_scores(question_id, option_scores)
+
+    if len(answers_by_id) != 16:
+        return []
+    return [
+        answers_by_id[question_id]
+        for question_id in sorted(answers_by_id, key=lambda value: int(value) if value.isdigit() else value)
+    ]
+
+
 def _detect_answers_from_rgb(rgb: Any) -> list[dict[str, Any]]:
     try:
         import cv2
         import numpy as np
     except ImportError:
         return []
+
+    registered_answers = _detect_answers_from_registered_grid(rgb)
+    if len(registered_answers) == 16:
+        return registered_answers
 
     height, width = rgb.shape[:2]
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
